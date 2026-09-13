@@ -30,6 +30,7 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var bluetoothReady = false
     @Published var canSync = false
     @Published var isActivitySyncing = false
+    @Published var batteryLevel: Int? = nil
     @Published var activityDays: [ActivityDay] = []
     @Published var diagnosticLog: [String] = []
     @Published var strideLengthCm: Double = 75.0 {
@@ -53,6 +54,7 @@ final class BLEManager: NSObject, ObservableObject {
     private var currentTodaySteps: Int?
     private var currentTodayCalories: Int?
     private var awaitingCurrentTotals = false
+    private var awaitingBattery = false
     private var sportRequestCount = 0
     private let maxSportRequests = 1000
     private let recordsDefaultsKey = "aviator.activityRecords.v3"
@@ -99,6 +101,28 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
         sendTimePacket()
+    }
+
+    func disconnect() {
+        guard let peripheral = connectedPeripheral else {
+            status = "Nincs csatlakoztatott óra."
+            return
+        }
+        central.cancelPeripheralConnection(peripheral)
+        status = "Bluetooth kapcsolat bontása…"
+    }
+
+    func syncData() {
+        guard canWrite else {
+            status = "Előbb csatlakozz az AVIATOR órához."
+            return
+        }
+        awaitingBattery = true
+        sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akkumulátor")
+        status = "Akkumulátor és aktivitási adatok lekérése…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+            self?.startActivitySync()
+        }
     }
 
     func syncTimeAndActivity() {
@@ -191,6 +215,20 @@ final class BLEManager: NSObject, ObservableObject {
 
         // A Mark 1 válaszcsomagok 0x6E fejléccel és 0x8F lezárással érkeznek.
         guard bytes.first == 0x6E, bytes.last == 0x8F else { return }
+
+        // Mark 1 akkumulátor-lekérés válasza. A diagnosztikai naplóban a teljes
+        // csomagot is megtartjuk, így firmware-eltérés esetén pontosítható a dekódolás.
+        if awaitingBattery && bytes.count >= 5 {
+            if bytes.contains(0x0F) {
+                let body = bytes.dropFirst(3).dropLast()
+                if let level = body.first(where: { $0 <= 100 }) {
+                    batteryLevel = Int(level)
+                    log("Akkumulátor: \(level)%")
+                }
+                awaitingBattery = false
+                return
+            }
+        }
 
         // Napi aktuális összesítő. A gyári appban a 20 bájtos válaszból:
         // [7...10] = calories, [11...14] = steps (little endian).
@@ -375,7 +413,9 @@ extension BLEManager: CBCentralManagerDelegate {
         notifyCharacteristic = nil
         canSync = false
         isActivitySyncing = false
-        status = "Az óra kapcsolata megszakadt."
+        connectedPeripheral = nil
+        batteryLevel = nil
+        status = "Az óra lecsatlakoztatva."
     }
 }
 
