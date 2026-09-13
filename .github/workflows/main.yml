@@ -1,4 +1,4 @@
-name: Build AVIATOR Sync Mac
+name: Build AVIATOR Sync Mac v2
 
 on:
   workflow_dispatch:
@@ -11,13 +11,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create build folders
+      - name: Create folders
         run: |
           mkdir -p build
           mkdir -p "AVIATOR Sync.app/Contents/MacOS"
           mkdir -p "AVIATOR Sync.app/Contents/Resources"
 
-      - name: Build Intel version
+      - name: Build Intel binary
         run: |
           xcrun swiftc \
             -target x86_64-apple-macos13.0 \
@@ -30,7 +30,7 @@ jobs:
             -framework AppKit \
             -o build/AviatorSyncIntel
 
-      - name: Build Apple Silicon version
+      - name: Build Apple Silicon binary
         run: |
           xcrun swiftc \
             -target arm64-apple-macos13.0 \
@@ -43,14 +43,24 @@ jobs:
             -framework AppKit \
             -o build/AviatorSyncARM
 
-      - name: Create Universal Mac app
+      - name: Create universal executable
         run: |
           lipo -create \
             build/AviatorSyncIntel \
             build/AviatorSyncARM \
-            -output "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+            -output "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac.bin"
 
-          chmod +x "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+          chmod +x "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac.bin"
+
+      - name: Create Finder launcher
+        run: |
+          cat > "AVIATOR Sync.app/Contents/MacOS/AviatorSyncLauncher" <<'EOF'
+          #!/bin/bash
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          exec "$HERE/AviatorSyncMac.bin"
+          EOF
+
+          chmod +x "AVIATOR Sync.app/Contents/MacOS/AviatorSyncLauncher"
 
       - name: Create Info.plist
         run: |
@@ -67,30 +77,37 @@ jobs:
               <string>AVIATOR Sync</string>
 
               <key>CFBundleIdentifier</key>
-              <string>com.aviator.syncmac</string>
+              <string>com.aviator.syncmac.v2</string>
 
               <key>CFBundleVersion</key>
-              <string>1</string>
+              <string>2</string>
 
               <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
+              <string>2.0</string>
 
               <key>CFBundlePackageType</key>
               <string>APPL</string>
 
               <key>CFBundleExecutable</key>
-              <string>AviatorSyncMac</string>
+              <string>AviatorSyncLauncher</string>
 
               <key>LSMinimumSystemVersion</key>
               <string>13.0</string>
 
               <key>NSBluetoothAlwaysUsageDescription</key>
-              <string>Az AVIATOR órához való Bluetooth kapcsolathoz szükséges.</string>
+              <string>Az AVIATOR óra kereséséhez és az idő szinkronizálásához Bluetooth-hozzáférés szükséges.</string>
+
+              <key>NSHighResolutionCapable</key>
+              <true/>
           </dict>
           </plist>
           EOF
 
-      - name: Ad-hoc sign application
+      - name: Create PkgInfo
+        run: |
+          printf "APPL????" > "AVIATOR Sync.app/Contents/PkgInfo"
+
+      - name: Sign app
         run: |
           codesign \
             --force \
@@ -98,12 +115,14 @@ jobs:
             --sign - \
             "AVIATOR Sync.app"
 
-          codesign --verify --verbose "AVIATOR Sync.app"
+          codesign --verify --deep --strict --verbose=2 "AVIATOR Sync.app"
 
-      - name: Check architecture
+      - name: Test bundle
         run: |
-          file "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
-          lipo -archs "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+          plutil -lint "AVIATOR Sync.app/Contents/Info.plist"
+          file "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac.bin"
+          lipo -archs "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac.bin"
+          ls -la "AVIATOR Sync.app/Contents/MacOS"
 
       - name: Create ZIP
         run: |
@@ -111,11 +130,11 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             "AVIATOR Sync.app" \
-            "AVIATOR-Sync-Mac.zip"
+            "AVIATOR-Sync-Mac-v2.zip"
 
       - name: Upload Mac application
         uses: actions/upload-artifact@v4
         with:
-          name: AVIATOR-Sync-Mac
-          path: AVIATOR-Sync-Mac.zip
+          name: AVIATOR-Sync-Mac-v2
+          path: AVIATOR-Sync-Mac-v2.zip
           if-no-files-found: error
