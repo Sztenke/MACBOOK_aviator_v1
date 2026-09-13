@@ -55,6 +55,8 @@ final class BLEManager: NSObject, ObservableObject {
     private var currentTodayCalories: Int?
     private var awaitingCurrentTotals = false
     private var awaitingBattery = false
+    private var manualDisconnect = false
+    private var reconnectPeripheral: CBPeripheral?
     private var sportRequestCount = 0
     private let maxSportRequests = 1000
     private let recordsDefaultsKey = "aviator.activityRecords.v3"
@@ -88,6 +90,8 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func connect(to peripheral: CBPeripheral) {
+        manualDisconnect = false
+        reconnectPeripheral = peripheral
         stopScan()
         connectedPeripheral = peripheral
         peripheral.delegate = self
@@ -104,6 +108,9 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        manualDisconnect = true
+        reconnectPeripheral = nil
+        isActivitySyncing = false
         guard let peripheral = connectedPeripheral else {
             status = "Nincs csatlakoztatott óra."
             return
@@ -152,9 +159,14 @@ final class BLEManager: NSObject, ObservableObject {
         // Eredeti Mark 1 app: getSportDataTotal
         sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi összesítő")
 
-        // Eredeti Mark 1 app: getSportDataDetail
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-            self?.requestNextSportRecord()
+        // v3.3: a normál adatszinkron NEM járja végig az óra teljes sportmemóriáját.
+        // A Mark 1 több száz régi rekord gyors lekérésénél megszakíthatja a BLE kapcsolatot.
+        // A napi összesítő válaszára várunk, majd biztonságosan lezárjuk a szinkront.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, self.isActivitySyncing else { return }
+            self.finishActivitySync(message: self.currentTodaySteps == nil
+                ? "Adatszinkron kész. A napi összesítő válasza diagnosztikában rögzítve."
+                : "✓ Mai aktivitási adatok szinkronizálva.")
         }
     }
 
@@ -272,9 +284,7 @@ final class BLEManager: NSObject, ObservableObject {
                 log("Nem értelmezhető sport rekord; rawTime=\(rawTime), steps=\(steps), cal=\(calories)")
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-                self?.requestNextSportRecord()
-            }
+            // v3.3: nem kérjük automatikusan a következő régi rekordot.
             return
         }
 
@@ -393,6 +403,10 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        manualDisconnect = false
+        reconnectPeripheral = peripheral
+        connectedPeripheral = peripheral
+        peripheral.delegate = self
         connectedID = peripheral.identifier
         status = "Csatlakozva. AVIATOR BLE szolgáltatás keresése…"
         peripheral.discoverServices(nil)
@@ -414,8 +428,25 @@ extension BLEManager: CBCentralManagerDelegate {
         canSync = false
         isActivitySyncing = false
         connectedPeripheral = nil
-        batteryLevel = nil
-        status = "Az óra lecsatlakoztatva."
+
+        if manualDisconnect {
+            batteryLevel = nil
+            status = "Az óra kézzel lecsatlakoztatva."
+            log(status)
+            return
+        }
+
+        // Váratlan kapcsolatvesztésnél automatikus visszacsatlakozás.
+        reconnectPeripheral = peripheral
+        status = "Bluetooth kapcsolat megszakadt. Automatikus újracsatlakozás…"
+        log(status + (error.map { " (\($0.localizedDescription))" } ?? ""))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak peripheral] in
+            guard let self, let peripheral, !self.manualDisconnect,
+                  self.central.state == .poweredOn else { return }
+            self.connectedPeripheral = peripheral
+            peripheral.delegate = self
+            self.central.connect(peripheral, options: nil)
+        }
     }
 }
 
