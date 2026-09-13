@@ -1,0 +1,121 @@
+name: Build AVIATOR Sync Mac
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create build folders
+        run: |
+          mkdir -p build
+          mkdir -p "AVIATOR Sync.app/Contents/MacOS"
+          mkdir -p "AVIATOR Sync.app/Contents/Resources"
+
+      - name: Build Intel version
+        run: |
+          xcrun swiftc \
+            -target x86_64-apple-macos13.0 \
+            -parse-as-library \
+            AviatorSyncMacApp.swift \
+            ContentView.swift \
+            BLEManager.swift \
+            -framework SwiftUI \
+            -framework CoreBluetooth \
+            -framework AppKit \
+            -o build/AviatorSyncIntel
+
+      - name: Build Apple Silicon version
+        run: |
+          xcrun swiftc \
+            -target arm64-apple-macos13.0 \
+            -parse-as-library \
+            AviatorSyncMacApp.swift \
+            ContentView.swift \
+            BLEManager.swift \
+            -framework SwiftUI \
+            -framework CoreBluetooth \
+            -framework AppKit \
+            -o build/AviatorSyncARM
+
+      - name: Create Universal Mac app
+        run: |
+          lipo -create \
+            build/AviatorSyncIntel \
+            build/AviatorSyncARM \
+            -output "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+
+          chmod +x "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+
+      - name: Create Info.plist
+        run: |
+          cat > "AVIATOR Sync.app/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>AVIATOR Sync</string>
+
+              <key>CFBundleDisplayName</key>
+              <string>AVIATOR Sync</string>
+
+              <key>CFBundleIdentifier</key>
+              <string>com.aviator.syncmac</string>
+
+              <key>CFBundleVersion</key>
+              <string>1</string>
+
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+
+              <key>CFBundleExecutable</key>
+              <string>AviatorSyncMac</string>
+
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+
+              <key>NSBluetoothAlwaysUsageDescription</key>
+              <string>Az AVIATOR órához való Bluetooth kapcsolathoz szükséges.</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Ad-hoc sign application
+        run: |
+          codesign \
+            --force \
+            --deep \
+            --sign - \
+            "AVIATOR Sync.app"
+
+          codesign --verify --verbose "AVIATOR Sync.app"
+
+      - name: Check architecture
+        run: |
+          file "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+          lipo -archs "AVIATOR Sync.app/Contents/MacOS/AviatorSyncMac"
+
+      - name: Create ZIP
+        run: |
+          ditto -c -k \
+            --sequesterRsrc \
+            --keepParent \
+            "AVIATOR Sync.app" \
+            "AVIATOR-Sync-Mac.zip"
+
+      - name: Upload Mac application
+        uses: actions/upload-artifact@v4
+        with:
+          name: AVIATOR-Sync-Mac
+          path: AVIATOR-Sync-Mac.zip
+          if-no-files-found: error
