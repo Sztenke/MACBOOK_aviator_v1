@@ -69,7 +69,10 @@ final class BLEManager: NSObject, ObservableObject {
         }
         devices.removeAll()
         isScanning = true
-        status = "Közeli BLE eszközök keresése…"
+        status = "AVIATOR óra keresése…"
+        // Nem korlátozzuk a rádiós keresést kizárólag service UUID-ra, mert egyes Mark 1
+        // példányok nem minden advertising csomagban hirdetik a 6006 szolgáltatást.
+        // A találatokat a didDiscover-ben szűrjük, így a listában csak AVIATOR jelenik meg.
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
@@ -275,7 +278,14 @@ extension BLEManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Névtelen BLE eszköz"
+        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = peripheral.name ?? advertisedName ?? "Névtelen BLE eszköz"
+        let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        let isAviatorName = name.lowercased().contains("aviator")
+        let hasAviatorService = serviceUUIDs.contains(serviceUUID)
+
+        // A felületen kizárólag AVIATOR óra jelenjen meg.
+        guard isAviatorName || hasAviatorService else { return }
         upsert(peripheral, name: name, rssi: RSSI.intValue)
     }
 
