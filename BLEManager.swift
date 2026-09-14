@@ -127,12 +127,14 @@ final class BLEManager: NSObject, ObservableObject {
             status = "Előbb csatlakozz az AVIATOR órához."
             return
         }
+        // A Mark 1 0x0F válasza a jelenlegi napi állapotot is tartalmazza.
+        // Nem indítunk többé részletes rekord-letöltési ciklust, mert az óra
+        // régi, 2021–2022-es rekordokat ad vissza sorban, ami feleslegesen
+        // terheli a BLE kapcsolatot és nem a mai állapotot mutatja.
         awaitingBattery = true
-        sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akkumulátor")
-        status = "Akkumulátor és az elmúlt heti aktivitási adatok lekérése…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-            self?.startActivitySync()
-        }
+        awaitingCurrentTotals = true
+        sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akku + mai aktivitás")
+        status = "Akkumulátor és mai aktivitási adatok lekérése…"
     }
 
     func syncTimeAndActivity() {
@@ -232,25 +234,42 @@ final class BLEManager: NSObject, ObservableObject {
         // bájtot százaléknak vette, ezért a 0x28 értéket tévesen 40%-nak mutatta.
         // Ennél a Mark 1-nél ez töltöttségi/voltage kód: a teljesen feltöltött órán 0x28 (40).
         // 32..40 tartományt skálázunk 0..100%-ra; 40 vagy fölötte = 100%.
-        if awaitingBattery && bytes.count >= 5 && bytes[2] == 0x0F {
-            let raw = Int(bytes[3])
+        if bytes.count == 20 && bytes[2] == 0x0F {
+            // Mark 1: a 0x0F válasz nem csak akkukódot ad vissza.
+            // A tesztórán a [11...14] little-endian mező pontosan a számlapon
+            // látható aktuális napi lépésszámot tartalmazza (pl. 0x0A3C = 2620).
+            let rawBattery = Int(bytes[3])
             let percent: Int
-            if raw >= 40 {
+            if rawBattery >= 40 {
                 percent = 100
-            } else if raw <= 32 {
+            } else if rawBattery <= 32 {
                 percent = 0
             } else {
-                percent = min(100, max(0, Int((Double(raw - 32) / 8.0 * 100.0).rounded())))
+                percent = min(100, max(0, Int((Double(rawBattery - 32) / 8.0 * 100.0).rounded())))
             }
             batteryLevel = percent
-            log("Akkumulátor: \(percent)% (Mark 1 raw=\(raw))")
+
+            let todayCalories = Int(leUInt32(bytes, 7))
+            let todaySteps = Int(leUInt32(bytes, 11))
+            if todaySteps >= 0 && todaySteps < 500_000 {
+                currentTodaySteps = todaySteps
+                currentTodayCalories = max(0, min(todayCalories, 100_000))
+                saveTodaySnapshot(steps: todaySteps, calories: currentTodayCalories ?? 0)
+                log("Mai állapot: \(todaySteps) lépés, \(currentTodayCalories ?? 0) kcal, akku \(percent)%")
+            } else {
+                log("Mai lépésszám nem értelmezhető: \(todaySteps)")
+            }
             awaitingBattery = false
+            awaitingCurrentTotals = false
+            isActivitySyncing = false
+            rebuildActivityDays()
+            status = "✓ Mai adatok szinkronizálva."
             return
         }
 
         // Napi aktuális összesítő. A gyári appban a 20 bájtos válaszból:
         // [7...10] = calories, [11...14] = steps (little endian).
-        if awaitingCurrentTotals && bytes.count == 20 {
+        if awaitingCurrentTotals && bytes.count == 20 && bytes[2] == 0x1B {
             let calories = Int(leUInt32(bytes, 7))
             let steps = Int(leUInt32(bytes, 11))
             if steps >= 0 && steps < 500_000 && calories >= 0 && calories < 100_000 {
@@ -392,6 +411,27 @@ final class BLEManager: NSObject, ObservableObject {
 
         activityDays = grouped.map { ActivityDay(date: $0.key, steps: $0.value.steps, calories: $0.value.calories) }
             .sorted { $0.date > $1.date }
+    }
+
+    /// A mai nap egyetlen összesített pillanatképét tároljuk. Csak a mai nap
+    /// írható felül; minden korábbi nap változatlan marad.
+    private func saveTodaySnapshot(steps: Int, calories: Int) {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+
+        // Csak a mai naphoz tartozó korábbi pillanatképet/részrekordot cseréljük.
+        // Tegnapi és régebbi adatot soha nem írunk felül.
+        let todayKeys = recordsByTimestamp.compactMap { key, value in
+            cal.isDate(value.date, inSameDayAs: today) ? key : nil
+        }
+        for key in todayKeys { recordsByTimestamp.removeValue(forKey: key) }
+
+        let dayKey = UInt32(max(0, Int(today.timeIntervalSince1970)))
+        recordsByTimestamp[dayKey] = ActivityRecord(rawTimestamp: dayKey,
+                                                    date: today,
+                                                    steps: steps,
+                                                    calories: calories)
+        saveStoredActivity()
     }
 
     private func saveStoredActivity() {

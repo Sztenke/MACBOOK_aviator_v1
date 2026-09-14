@@ -59,13 +59,13 @@ struct ContentView: View {
                 summaryCard(title: "Akkumulátor", value: ble.batteryLevel.map { "\($0)%" } ?? "–", icon: "battery.75")
                 summaryCard(title: activityCardPrefix + " lépések", value: displayActivity.map { "\($0.steps)" } ?? "–", icon: "figure.walk")
                 summaryCard(title: activityCardPrefix + " távolság", value: displayActivity.map { String(format: "%.2f km", ble.distanceKm(for: $0.steps)) } ?? "–", icon: "location")
-                summaryCard(title: activityCardPrefix + " kalória", value: displayActivity.map { String(format: "%.1f kcal", Double($0.calories) / 1000.0) } ?? "–", icon: "flame")
+                summaryCard(title: activityCardPrefix + " kalória", value: displayActivity.map { String(format: "%.1f kcal", Double($0.calories)) } ?? "–", icon: "flame")
             }
             HStack {
                 Text("Lépéshossz:").foregroundStyle(.secondary)
                 TextField("75", value: $ble.strideLengthCm, format: .number.precision(.fractionLength(0))).frame(width: 60).textFieldStyle(.roundedBorder)
                 Text("cm").foregroundStyle(.secondary)
-                Spacer(); Text("\(ble.totalStoredDays) nap eltárolva").font(.caption).foregroundStyle(.secondary)
+                Spacer(); Text("Heti nézet: \(recentSevenDays.count) nap").font(.caption).foregroundStyle(.secondary)
             }
             Spacer(); statusLine
         }.padding(.top, 8)
@@ -92,10 +92,10 @@ struct ContentView: View {
 
     private var activityTab: some View {
         VStack(spacing: 12) {
-            HStack { Text("Aktivitási előzmények").font(.title2.bold()); Spacer(); Text("\(ble.totalStoredDays) nap").foregroundStyle(.secondary) }
+            HStack { Text("Aktivitási előzmények").font(.title2.bold()); Spacer(); Text("Elmúlt 7 nap").foregroundStyle(.secondary) }
             GroupBox {
                 if ble.activityDays.isEmpty { Text("Még nincs letöltött aktivitási adat.").foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding() }
-                else { List(ble.activityDays) { day in HStack { Text(day.date.formatted(date: .numeric, time: .omitted)).frame(maxWidth: .infinity, alignment: .leading); Text("\(day.steps)").frame(width: 100, alignment: .trailing); Text(String(format: "%.2f km", ble.distanceKm(for: day.steps))).frame(width: 110, alignment: .trailing); Text(String(format: "%.1f kcal", Double(day.calories) / 1000.0)).frame(width: 100, alignment: .trailing) } } }
+                else { List(recentSevenDays) { day in HStack { Text(day.date.formatted(date: .numeric, time: .omitted)).frame(maxWidth: .infinity, alignment: .leading); Text("\(day.steps)").frame(width: 100, alignment: .trailing); Text(String(format: "%.2f km", ble.distanceKm(for: day.steps))).frame(width: 110, alignment: .trailing); Text(String(format: "%.1f kcal", Double(day.calories))).frame(width: 100, alignment: .trailing) } } }
             }
             statusLine
         }.padding(.top, 8)
@@ -109,7 +109,7 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 summaryCard(title: "Összes lépés", value: "\(days.reduce(0){$0+$1.steps})", icon: "figure.walk")
                 summaryCard(title: "Összes távolság", value: String(format: "%.2f km", days.reduce(0.0){$0+ble.distanceKm(for:$1.steps)}), icon: "location")
-                summaryCard(title: "Összes kalória", value: String(format: "%.1f kcal", Double(days.reduce(0){$0+$1.calories}) / 1000.0), icon: "flame")
+                summaryCard(title: "Összes kalória", value: String(format: "%.1f kcal", Double(days.reduce(0){$0+$1.calories})), icon: "flame")
             }
             GroupBox { PrettyBarChart(days: filledChartDays, metric: chartMetric, distanceProvider: ble.distanceKm(for:)).frame(minHeight: 360).padding(12) }
             statusLine
@@ -142,17 +142,29 @@ struct ContentView: View {
     private var displayActivity: ActivityDay? { todayActivity ?? ble.activityDays.first }
     private var activityCardPrefix: String { todayActivity != nil ? "Mai" : "Legutóbbi" }
 
-    // A Mark 1 régi, az órában tárolt rekordokat is visszaad. Ha nincs aktuális dátumú
-    // rekord, a grafikon akkor is a legutóbbi 7/30 eltárolt napot mutatja, nem üres mezőt.
+    // Csak a naptár szerinti aktuális 7/30 napot mutatjuk. A régi 2021–2022-es
+    // óratörténet helyben megmaradhat, de nem keverjük bele a jelenlegi nézetbe.
+    private var recentSevenDays: [ActivityDay] {
+        recentDays(7).sorted { $0.date > $1.date }
+    }
+    private func recentDays(_ count: Int) -> [ActivityDay] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let start = cal.date(byAdding: .day, value: -(count - 1), to: today) ?? today
+        return ble.activityDays.filter {
+            let d = cal.startOfDay(for: $0.date)
+            return d >= start && d <= today
+        }
+    }
     private var chartDays: [ActivityDay] {
-        Array(ble.activityDays.prefix(chartRange.rawValue)).sorted { $0.date < $1.date }
+        recentDays(chartRange.rawValue).sorted { $0.date < $1.date }
     }
     private var filledChartDays: [ActivityDay] { chartDays }
 }
 
 private struct PrettyBarChart: View {
     let days:[ActivityDay]; let metric:ActivityMetric; let distanceProvider:(Int)->Double
-    private func val(_ d:ActivityDay)->Double { switch metric { case .steps:return Double(d.steps); case .distance:return distanceProvider(d.steps); case .calories:return Double(d.calories) / 1000.0 } }
+    private func val(_ d:ActivityDay)->Double { switch metric { case .steps:return Double(d.steps); case .distance:return distanceProvider(d.steps); case .calories:return Double(d.calories) } }
     private var maxV:Double { max(days.map(val).max() ?? 0, metric == .steps ? 1000 : 1) }
     private func text(_ v:Double)->String { switch metric { case .steps:return String(Int(v)); case .distance:return String(format:"%.2f",v); case .calories:return String(format:"%.1f",v) } }
     var body: some View {
