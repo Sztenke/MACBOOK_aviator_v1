@@ -159,14 +159,10 @@ final class BLEManager: NSObject, ObservableObject {
         // Eredeti Mark 1 app: getSportDataTotal
         sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi összesítő")
 
-        // v3.3: a normál adatszinkron NEM járja végig az óra teljes sportmemóriáját.
-        // A Mark 1 több száz régi rekord gyors lekérésénél megszakíthatja a BLE kapcsolatot.
-        // A napi összesítő válaszára várunk, majd biztonságosan lezárjuk a szinkront.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self, self.isActivitySyncing else { return }
-            self.finishActivitySync(message: self.currentTodaySteps == nil
-                ? "Adatszinkron kész. A napi összesítő válasza diagnosztikában rögzítve."
-                : "✓ Mai aktivitási adatok szinkronizálva.")
+        // A v3.1-ben működő Mark 1 aktivitás-lekérés visszaállítva.
+        // A napi összesítő után részletes rekordokat kérünk, ugyanúgy mint a működő verzióban.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+            self?.requestNextSportRecord()
         }
     }
 
@@ -228,18 +224,24 @@ final class BLEManager: NSObject, ObservableObject {
         // A Mark 1 válaszcsomagok 0x6E fejléccel és 0x8F lezárással érkeznek.
         guard bytes.first == 0x6E, bytes.last == 0x8F else { return }
 
-        // Mark 1 akkumulátor-lekérés válasza. A diagnosztikai naplóban a teljes
-        // csomagot is megtartjuk, így firmware-eltérés esetén pontosítható a dekódolás.
-        if awaitingBattery && bytes.count >= 5 {
-            if bytes.contains(0x0F) {
-                let body = bytes.dropFirst(3).dropLast()
-                if let level = body.first(where: { $0 <= 100 }) {
-                    batteryLevel = Int(level)
-                    log("Akkumulátor: \(level)%")
-                }
-                awaitingBattery = false
-                return
+        // Mark 1 akkumulátor-válasz. A korábbi hibás kód az első 0...100 közötti
+        // bájtot százaléknak vette, ezért a 0x28 értéket tévesen 40%-nak mutatta.
+        // Ennél a Mark 1-nél ez töltöttségi/voltage kód: a teljesen feltöltött órán 0x28 (40).
+        // 32..40 tartományt skálázunk 0..100%-ra; 40 vagy fölötte = 100%.
+        if awaitingBattery && bytes.count >= 5 && bytes[2] == 0x0F {
+            let raw = Int(bytes[3])
+            let percent: Int
+            if raw >= 40 {
+                percent = 100
+            } else if raw <= 32 {
+                percent = 0
+            } else {
+                percent = min(100, max(0, Int((Double(raw - 32) / 8.0 * 100.0).rounded())))
             }
+            batteryLevel = percent
+            log("Akkumulátor: \(percent)% (Mark 1 raw=\(raw))")
+            awaitingBattery = false
+            return
         }
 
         // Napi aktuális összesítő. A gyári appban a 20 bájtos válaszból:
@@ -284,7 +286,11 @@ final class BLEManager: NSObject, ObservableObject {
                 log("Nem értelmezhető sport rekord; rawTime=\(rawTime), steps=\(steps), cal=\(calories)")
             }
 
-            // v3.3: nem kérjük automatikusan a következő régi rekordot.
+            // A működő v3.1 viselkedése: folytatjuk a Mark 1 sportrekordok lekérését.
+            // Kis késleltetéssel kíméljük a BLE kapcsolatot.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                self?.requestNextSportRecord()
+            }
             return
         }
 

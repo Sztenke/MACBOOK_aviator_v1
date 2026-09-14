@@ -17,3 +17,11 @@ v3.3 változások:
 - váratlan Bluetooth-bontás után automatikus visszacsatlakozás
 - kézi Lecsatlakoztatás után nincs automatikus visszacsatlakozás
 - akkumulátor + napi összesítő biztonságos lekérése
+
+
+AVIATOR Sync Mac v3.4-restored
+- Mark 1 / AVW79215G360
+- v3.1 működő aktivitás-lekérés visszaállítva
+- külön Idő szinkron és Adatok szinkron
+- Bluetooth kézi lecsatlakoztatás + váratlan bontás utáni újracsatlakozás
+- akkumulátor 0x28 raw kód teljes töltöttségként kezelve (100%)
