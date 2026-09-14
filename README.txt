@@ -9,3 +9,10 @@ Javítások:
 - váratlan Bluetooth-bontásnál automatikus visszacsatlakozás
 
 Megjegyzés: a Mark 1 a tesztben 2021-2022 dátumú aktivitásrekordokat küldött vissza. Ezeket az app nem hamisítja át 2026-ra.
+
+
+v3.6 heti szinkron:
+- Az aktivitási lekérés egy ideiglenes pufferbe gyűjt.
+- Csak az óra által visszaadott legfrissebb 7 nap kerül mentésre.
+- A már eltárolt korábbi napokat nem írja felül.
+- A mai nap frissülhet, mert annak számai nap közben változnak.

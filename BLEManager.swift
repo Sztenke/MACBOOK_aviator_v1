@@ -58,7 +58,10 @@ final class BLEManager: NSObject, ObservableObject {
     private var manualDisconnect = false
     private var reconnectPeripheral: CBPeripheral?
     private var sportRequestCount = 0
-    private let maxSportRequests = 1000
+    private let maxSportRequests = 1200
+    // Egy szinkron alatt ide gyűjtjük az órától érkező rekordokat.
+    // Csak a legutóbbi 7 nap kerül be a helyi adatbázisba a szinkron végén.
+    private var pendingWeekRecords: [UInt32: ActivityRecord] = [:]
     private let recordsDefaultsKey = "aviator.activityRecords.v3"
 
     override init() {
@@ -126,7 +129,7 @@ final class BLEManager: NSObject, ObservableObject {
         }
         awaitingBattery = true
         sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akkumulátor")
-        status = "Akkumulátor és aktivitási adatok lekérése…"
+        status = "Akkumulátor és az elmúlt heti aktivitási adatok lekérése…"
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
             self?.startActivitySync()
         }
@@ -151,10 +154,11 @@ final class BLEManager: NSObject, ObservableObject {
         }
         isActivitySyncing = true
         sportRequestCount = 0
+        pendingWeekRecords.removeAll()
         currentTodaySteps = nil
         currentTodayCalories = nil
         awaitingCurrentTotals = true
-        log("Aktivitás-szinkron indítása")
+        log("Heti aktivitás-szinkron indítása")
 
         // Eredeti Mark 1 app: getSportDataTotal
         sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi összesítő")
@@ -278,9 +282,10 @@ final class BLEManager: NSObject, ObservableObject {
                                             date: date,
                                             steps: steps,
                                             calories: calories)
-                recordsByTimestamp[rawTime] = record // duplikáció ellen
-                saveStoredActivity()
-                rebuildActivityDays()
+                // Nem írjuk azonnal a helyi adatbázisba. A Mark 1 régi rekordokat is
+                // visszaad, ezért egy ideiglenes pufferbe gyűjtünk, majd a végén
+                // csak az óra által visszaadott legfrissebb 7 napot mentjük.
+                pendingWeekRecords[rawTime] = record
                 log("Rekord: \(date.formatted()) | \(steps) lépés | \(calories) kcal")
             } else {
                 log("Nem értelmezhető sport rekord; rawTime=\(rawTime), steps=\(steps), cal=\(calories)")
@@ -303,9 +308,48 @@ final class BLEManager: NSObject, ObservableObject {
     private func finishActivitySync(message: String) {
         isActivitySyncing = false
         awaitingCurrentTotals = false
+        mergeLatestWeekWithoutOverwritingHistory()
         rebuildActivityDays()
-        status = message + " \(activityDays.count) nap helyben eltárolva."
+        status = message + " A legutóbbi heti adatok frissítve. \(activityDays.count) nap helyben eltárolva."
         log(status)
+    }
+
+    /// Az órából egy szinkron alatt érkező rekordok közül csak a legfrissebb 7 napot
+    /// vesszük át. A már korábban eltárolt, lezárt napokat nem írjuk felül.
+    /// A mai nap kivétel: annak értékei a nap folyamán növekedhetnek.
+    private func mergeLatestWeekWithoutOverwritingHistory() {
+        guard !pendingWeekRecords.isEmpty else { return }
+        let cal = Calendar.current
+        guard let newestDate = pendingWeekRecords.values.map({ $0.date }).max() else { return }
+        let newestDay = cal.startOfDay(for: newestDate)
+        guard let weekStart = cal.date(byAdding: .day, value: -6, to: newestDay) else { return }
+        let today = cal.startOfDay(for: Date())
+
+        // Mely napok vannak már helyben? A mai napot nem tekintjük lezártnak.
+        let existingClosedDays = Set(recordsByTimestamp.values.map { cal.startOfDay(for: $0.date) }.filter { $0 < today })
+
+        var added = 0
+        var skippedOld = 0
+        var skippedExisting = 0
+        for (raw, record) in pendingWeekRecords {
+            let day = cal.startOfDay(for: record.date)
+            guard day >= weekStart && day <= newestDay else {
+                skippedOld += 1
+                continue
+            }
+            if day < today && existingClosedDays.contains(day) {
+                skippedExisting += 1
+                continue
+            }
+            // Ugyanazt a félórás rekordot sem írjuk felül, ha már megvan.
+            if recordsByTimestamp[raw] == nil {
+                recordsByTimestamp[raw] = record
+                added += 1
+            }
+        }
+        saveStoredActivity()
+        log("Heti mentés: +\(added) rekord, \(skippedOld) hétnél régebbi kihagyva, \(skippedExisting) korábbi nap változatlan.")
+        pendingWeekRecords.removeAll()
     }
 
     private func leUInt32(_ bytes: [UInt8], _ start: Int) -> UInt32 {
