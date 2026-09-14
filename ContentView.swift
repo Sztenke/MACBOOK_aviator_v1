@@ -11,6 +11,9 @@ struct ContentView: View {
     @StateObject private var ble = BLEManager()
     @State private var selectedTab = 0
     @State private var metric: Metric = .steps
+    @State private var shownMonth = Date()
+    @State private var calibrationDistance = 2.74
+    @State private var calibrationCalories = 178.0
 
     var body: some View {
         VStack(spacing: 10) {
@@ -22,7 +25,7 @@ struct ContentView: View {
             }
         }
         .padding(18)
-        .frame(minWidth: 900, minHeight: 680)
+        .frame(minWidth: 940, minHeight: 720)
     }
 
     private var header: some View {
@@ -56,7 +59,7 @@ struct ContentView: View {
                             Button(ble.connectedID == device.id ? "Csatlakozva" : "Csatlakozás") { ble.connect(to: device.peripheral) }
                                 .disabled(ble.connectedID == device.id)
                         }
-                    }.frame(height: 160)
+                    }.frame(height: 150)
                 }.padding(4)
             }
 
@@ -73,43 +76,66 @@ struct ContentView: View {
                 card("Akkumulátor", ble.batteryLevel.map { "\($0)%" } ?? "–", "battery.75")
                 card("Mai lépések", today.map { "\($0.steps)" } ?? "–", "figure.walk")
                 card("Mai távolság", today.map { String(format: "%.2f km", ble.distanceKm(for: $0.steps)) } ?? "–", "location")
-                card("Mai kalória", today.map { "\($0.calories) kcal" } ?? "–", "flame")
+                card("Mai kalória", today.map { "\(ble.calories(for: $0.steps)) kcal" } ?? "–", "flame")
             }
 
-            HStack {
-                Text("Lépéshossz:").foregroundStyle(.secondary)
-                TextField("50", value: $ble.strideLengthCm, format: .number.precision(.fractionLength(0))).frame(width: 60).textFieldStyle(.roundedBorder)
-                Text("cm").foregroundStyle(.secondary)
-                Spacer()
+            GroupBox("Távolság és kalória kalibrálása") {
+                HStack(spacing: 12) {
+                    Text("Az órán most:").foregroundStyle(.secondary)
+                    TextField("2.74", value: $calibrationDistance, format: .number.precision(.fractionLength(2)))
+                        .frame(width: 80).textFieldStyle(.roundedBorder)
+                    Text("km")
+                    TextField("178", value: $calibrationCalories, format: .number.precision(.fractionLength(0)))
+                        .frame(width: 80).textFieldStyle(.roundedBorder)
+                    Text("kcal")
+                    Button("Kalibrálás a jelenlegi lépésszámhoz") {
+                        _ = ble.calibrate(distanceKm: calibrationDistance, calories: calibrationCalories)
+                    }
+                    .disabled(today == nil)
+                    Spacer()
+                }
+                .padding(4)
             }
+
+            Text("A Mark 1 jelenlegi állapotcsomagjából a napi lépésszám és az akkukód olvasható stabilan. A km és kcal értékeket az óra kijelzett értékeihez egyszer kalibráljuk; ezután a napi és havi nézet automatikusan számol velük.")
+                .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             Spacer()
             status
         }.padding(.top, 8)
     }
 
     private var monthly: some View {
-        VStack(spacing: 14) {
+        let days = monthDaysFilled
+        return VStack(spacing: 14) {
             HStack {
-                Text(Date.now.formatted(.dateTime.year().month(.wide))).font(.title2.bold())
+                Button { shownMonth = Calendar.current.date(byAdding: .month, value: -1, to: shownMonth) ?? shownMonth } label: {
+                    Image(systemName: "chevron.left")
+                }
+                Text(shownMonth.formatted(.dateTime.year().month(.wide))).font(.title2.bold()).frame(minWidth: 190)
+                Button { shownMonth = Calendar.current.date(byAdding: .month, value: 1, to: shownMonth) ?? shownMonth } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .disabled(Calendar.current.compare(shownMonth, to: Date(), toGranularity: .month) != .orderedAscending)
                 Spacer()
                 Picker("Mutató", selection: $metric) {
                     ForEach(Metric.allCases) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).frame(width: 430)
             }
 
-            let days = monthDaysFilled
             HStack(spacing: 12) {
                 card("Havi lépések", "\(days.reduce(0) { $0 + $1.steps })", "figure.walk")
                 card("Havi távolság", String(format: "%.2f km", days.reduce(0.0) { $0 + ble.distanceKm(for: $1.steps) }), "location")
-                card("Havi kalória", "\(days.reduce(0) { $0 + $1.calories }) kcal", "flame")
+                card("Havi kalória", "\(days.reduce(0) { $0 + ble.calories(for: $1.steps) }) kcal", "flame")
             }
 
             GroupBox {
-                MonthlyBarChart(days: days, metric: metric, distanceProvider: ble.distanceKm(for:))
-                    .frame(minHeight: 390)
+                MonthlyBarChart(days: days, metric: metric,
+                                distanceProvider: ble.distanceKm(for:),
+                                calorieProvider: ble.calories(for:))
+                    .frame(minHeight: 420)
                     .padding(12)
             }
-            Text("A grafikon a Macen helyben eltárolt napi szinkronokból épül. A korábbi napokat az alkalmazás nem írja felül; csak a mai nap frissül új szinkronkor.")
+            Text("Napi oszlopok a kiválasztott hónaphoz. A korábbi napok adatai megmaradnak; szinkronkor csak a mai nap frissül.")
                 .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             status
         }.padding(.top, 8)
@@ -117,7 +143,12 @@ struct ContentView: View {
 
     private var diagnostics: some View {
         VStack(spacing: 10) {
-            HStack { Text("Bluetooth diagnosztika").font(.title2.bold()); Spacer(); Text("Mark 1 protokoll").foregroundStyle(.secondary) }
+            HStack {
+                Text("Bluetooth diagnosztika").font(.title2.bold())
+                Spacer()
+                if let raw = ble.batteryRaw { Text("Akku raw: \(raw)").foregroundStyle(.secondary) }
+                Text("Mark 1 protokoll").foregroundStyle(.secondary)
+            }
             ScrollView {
                 Text(ble.diagnosticLog.joined(separator: "\n"))
                     .font(.system(.caption, design: .monospaced))
@@ -135,11 +166,11 @@ struct ContentView: View {
 
     private var monthDaysFilled: [ActivityDay] {
         let cal = Calendar.current
-        let now = Date()
-        let comps = cal.dateComponents([.year, .month], from: now)
+        let comps = cal.dateComponents([.year, .month], from: shownMonth)
         guard let start = cal.date(from: comps),
-              let range = cal.range(of: .day, in: .month, for: now) else { return [] }
-        let map = Dictionary(uniqueKeysWithValues: ble.currentMonthDays.map { (cal.startOfDay(for: $0.date), $0) })
+              let range = cal.range(of: .day, in: .month, for: start) else { return [] }
+        let data = ble.days(in: shownMonth)
+        let map = Dictionary(uniqueKeysWithValues: data.map { (cal.startOfDay(for: $0.date), $0) })
         return range.compactMap { day in
             guard let date = cal.date(byAdding: .day, value: day - 1, to: start) else { return nil }
             let key = cal.startOfDay(for: date)
@@ -169,46 +200,77 @@ private struct MonthlyBarChart: View {
     let days: [ActivityDay]
     let metric: Metric
     let distanceProvider: (Int) -> Double
+    let calorieProvider: (Int) -> Int
 
     private func value(_ d: ActivityDay) -> Double {
         switch metric {
         case .steps: return Double(d.steps)
         case .distance: return distanceProvider(d.steps)
-        case .calories: return Double(d.calories)
+        case .calories: return Double(calorieProvider(d.steps))
         }
     }
 
-    private var maxValue: Double { max(days.map(value).max() ?? 0, metric == .steps ? 1000 : 1) }
+    private var maxValue: Double {
+        let m = days.map(value).max() ?? 0
+        return max(m * 1.15, metric == .steps ? 1000 : 1)
+    }
 
     var body: some View {
         GeometryReader { g in
             let plotHeight = max(g.size.height - 55, 1)
-            ScrollView(.horizontal, showsIndicators: true) {
-                HStack(alignment: .bottom, spacing: 8) {
-                    ForEach(days) { d in
-                        let v = value(d)
-                        VStack(spacing: 4) {
-                            Spacer(minLength: 0)
-                            Text(v > 0 ? label(v) : "")
-                                .font(.system(size: 9)).foregroundStyle(.secondary).monospacedDigit()
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(v > 0 ? Color.accentColor : Color.secondary.opacity(0.12))
-                                .frame(width: 18, height: max(v > 0 ? 5 : 2, plotHeight * CGFloat(v / maxValue)))
-                            Text("\(Calendar.current.component(.day, from: d.date))")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }.frame(width: 30)
+            HStack(spacing: 8) {
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text(axisLabel(maxValue)).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(axisLabel(maxValue / 2)).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("0").font(.caption2).foregroundStyle(.secondary)
+                    Spacer().frame(height: 18)
+                }.frame(width: 48)
+
+                ScrollView(.horizontal, showsIndicators: true) {
+                    ZStack(alignment: .bottomLeading) {
+                        VStack(spacing: 0) {
+                            Divider(); Spacer(); Divider(); Spacer(); Divider()
+                        }
+                        .frame(height: plotHeight)
+
+                        HStack(alignment: .bottom, spacing: 7) {
+                            ForEach(days) { d in
+                                let v = value(d)
+                                VStack(spacing: 4) {
+                                    Spacer(minLength: 0)
+                                    Text(v > 0 ? label(v) : "")
+                                        .font(.system(size: 9)).foregroundStyle(.secondary).monospacedDigit()
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(v > 0 ? Color.accentColor : Color.secondary.opacity(0.10))
+                                        .frame(width: 20, height: max(v > 0 ? 6 : 2, plotHeight * CGFloat(v / maxValue)))
+                                    Text("\(Calendar.current.component(.day, from: d.date))")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }.frame(width: 31)
+                            }
+                        }
+                        .frame(minHeight: plotHeight + 25, alignment: .bottom)
                     }
+                    .frame(minWidth: max(g.size.width - 60, CGFloat(days.count) * 38), minHeight: g.size.height, alignment: .bottomLeading)
+                    .padding(.horizontal, 4)
                 }
-                .frame(minWidth: g.size.width, minHeight: g.size.height, alignment: .bottomLeading)
-                .padding(.horizontal, 8)
             }
+        }
+    }
+
+    private func axisLabel(_ v: Double) -> String {
+        switch metric {
+        case .steps: return String(Int(v.rounded()))
+        case .distance: return String(format: "%.1f", v)
+        case .calories: return String(Int(v.rounded()))
         }
     }
 
     private func label(_ v: Double) -> String {
         switch metric {
         case .steps: return String(Int(v))
-        case .distance: return String(format: "%.1f", v)
+        case .distance: return String(format: "%.2f", v)
         case .calories: return String(Int(v))
         }
     }

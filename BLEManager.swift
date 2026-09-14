@@ -23,14 +23,16 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var bluetoothReady = false
     @Published var canSync = false
     @Published var batteryLevel: Int?
+    @Published var batteryRaw: Int?
     @Published var activityDays: [ActivityDay] = []
     @Published var diagnosticLog: [String] = []
-    @Published var strideLengthCm: Double = 50.0 {
-        didSet {
-            let safe = min(max(strideLengthCm, 30), 150)
-            if safe != strideLengthCm { strideLengthCm = safe }
-            UserDefaults.standard.set(strideLengthCm, forKey: "strideLengthCm")
-        }
+
+    // Ezeket egyszer az óra kijelzett értékeihez kalibráljuk.
+    @Published var distancePerStepKm: Double = 0.0005 {
+        didSet { UserDefaults.standard.set(distancePerStepKm, forKey: "aviator.distancePerStepKm") }
+    }
+    @Published var caloriesPerStep: Double = 0.04 {
+        didSet { UserDefaults.standard.set(caloriesPerStep, forKey: "aviator.caloriesPerStep") }
     }
 
     private var central: CBCentralManager!
@@ -42,18 +44,18 @@ final class BLEManager: NSObject, ObservableObject {
     private let writeUUID = CBUUID(string: "00008001-0000-1000-8000-00805F9B34FB")
     private let notifyUUID = CBUUID(string: "00008002-0000-1000-8000-00805F9B34FB")
 
-    // A működő verzió kulcsa: 0x1B kérést küldünk, a Mark 1 pedig
-    // 20 bájtos 0x0F válaszban adja vissza a napi aktuális állapotot.
+    // A működő verzióból visszaállított Mark 1 lekérés.
     private var awaitingCurrentStatus = false
     private var manualDisconnect = false
     private var reconnectPeripheral: CBPeripheral?
-
     private let dayStoreKey = "aviator.activityDays.v4"
 
     override init() {
         super.init()
-        let savedStride = UserDefaults.standard.double(forKey: "strideLengthCm")
-        if savedStride >= 30 && savedStride <= 150 { strideLengthCm = savedStride }
+        let d = UserDefaults.standard.double(forKey: "aviator.distancePerStepKm")
+        let c = UserDefaults.standard.double(forKey: "aviator.caloriesPerStep")
+        if d > 0 { distancePerStepKm = d }
+        if c > 0 { caloriesPerStep = c }
         loadStoredDays()
         central = CBCentralManager(delegate: self, queue: .main)
     }
@@ -127,10 +129,7 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
         awaitingCurrentStatus = true
-
-        // FONTOS: ez a működő régi verzió parancsa.
-        // Nem 0x0F-et kérünk közvetlenül. A 0x1B kérésre érkezik a
-        // 20 bájtos 0x0F állapotcsomag, benne a napi lépésszámmal.
+        // Ez az a kérés, amellyel a felhasználónál ténylegesen működött a napi lépésszám.
         sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi aktuális állapot")
         status = "Mai lépésszám és akkumulátor lekérése…"
 
@@ -142,18 +141,38 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    func distanceKm(for steps: Int) -> Double {
-        Double(steps) * strideLengthCm / 100_000.0
+    var todaySteps: Int? {
+        activityDays.first { Calendar.current.isDateInToday($0.date) }?.steps
     }
 
-    var currentMonthDays: [ActivityDay] {
+    func distanceKm(for steps: Int) -> Double {
+        Double(steps) * distancePerStepKm
+    }
+
+    func calories(for steps: Int) -> Int {
+        max(0, Int((Double(steps) * caloriesPerStep).rounded()))
+    }
+
+    func calibrate(distanceKm: Double, calories: Double) -> Bool {
+        guard let steps = todaySteps, steps > 0, distanceKm > 0, calories > 0 else {
+            status = "Előbb szinkronizáld a mai lépésszámot, majd add meg az órán látható km és kcal értéket."
+            return false
+        }
+        distancePerStepKm = distanceKm / Double(steps)
+        caloriesPerStep = calories / Double(steps)
+        // A mai napot újramentjük, hogy az összes nézet azonnal frissüljön.
+        upsertToday(steps: steps)
+        status = String(format: "✓ Kalibrálva: %.2f km és %.0f kcal / %d lépés", distanceKm, calories, steps)
+        log(String(format: "Kalibráció: %d lépés -> %.2f km, %.0f kcal", steps, distanceKm, calories))
+        return true
+    }
+
+    func days(in month: Date) -> [ActivityDay] {
         let cal = Calendar.current
-        let now = Date()
-        let comps = cal.dateComponents([.year, .month], from: now)
-        guard let monthStart = cal.date(from: comps),
-              let nextMonth = cal.date(byAdding: .month, value: 1, to: monthStart) else { return [] }
-        return activityDays.filter { $0.date >= monthStart && $0.date < nextMonth }
-            .sorted { $0.date < $1.date }
+        let comps = cal.dateComponents([.year, .month], from: month)
+        guard let start = cal.date(from: comps),
+              let next = cal.date(byAdding: .month, value: 1, to: start) else { return [] }
+        return activityDays.filter { $0.date >= start && $0.date < next }.sorted { $0.date < $1.date }
     }
 
     private var canWrite: Bool { connectedPeripheral != nil && writeCharacteristic != nil }
@@ -171,41 +190,27 @@ final class BLEManager: NSObject, ObservableObject {
         guard !bytes.isEmpty else { return }
         log("RX: \(hex(bytes))")
         guard bytes.first == 0x6E, bytes.last == 0x8F else { return }
-
-        // A régi működő app logikáját tartjuk meg: amíg napi állapotot várunk,
-        // az első 20 bájtos Mark 1 csomagot értelmezzük. A gyakorlatban a
-        // 0x1B kérésre 0x0F típusú, 20 bájtos válasz érkezik.
         guard awaitingCurrentStatus, bytes.count == 20 else { return }
         awaitingCurrentStatus = false
 
-        let caloriesRaw = Int(leUInt32(bytes, 7))
+        // A működő verzió mezője: [11...14] little-endian = mai lépésszám.
         let steps = Int(leUInt32(bytes, 11))
-
         guard steps >= 0 && steps < 500_000 else {
             status = "A lépésszám válasza nem értelmezhető."
             log("Hibás napi lépésszám: \(steps)")
             return
         }
 
-        // Mark 1 tesztóra: teljes töltésnél a kód 0x28. A firmware nem küld
-        // külön 0–100 értéket, ezért a 0x20...0x28 tartományt százalékra skálázzuk.
+        // A Mark 1 teljes töltésnél 0x28 (=40) értéket küldött.
+        // Ezt 0...40 skálaként kezeljük és 0...100%-ra alakítjuk.
         let rawBattery = Int(bytes[3])
-        let battery = batteryPercent(from: rawBattery)
+        batteryRaw = rawBattery
+        let battery = max(0, min(100, Int((Double(rawBattery) / 40.0 * 100.0).rounded())))
         batteryLevel = battery
 
-        // A napi összesítő kcal mezőjét a korábbi verzió túl nagy számmal mutatta;
-        // százados skálán jelenítjük meg, és egész kcal-ként mentjük.
-        let calories = max(0, min(100_000, Int((Double(caloriesRaw) / 100.0).rounded())))
-
-        upsertToday(steps: steps, calories: calories)
+        upsertToday(steps: steps)
         status = "✓ Mai adatok frissítve: \(steps) lépés, akku \(battery)%"
-        log("Mai állapot: \(steps) lépés | \(calories) kcal | akku \(battery)% (raw 0x\(String(format: "%02X", rawBattery)))")
-    }
-
-    private func batteryPercent(from raw: Int) -> Int {
-        if raw >= 0x28 { return 100 }
-        if raw <= 0x20 { return 0 }
-        return Int((Double(raw - 0x20) / Double(0x28 - 0x20) * 100.0).rounded())
+        log("Mai állapot: \(steps) lépés | akku \(battery)% (raw \(rawBattery))")
     }
 
     private func leUInt32(_ bytes: [UInt8], _ start: Int) -> UInt32 {
@@ -216,13 +221,14 @@ final class BLEManager: NSObject, ObservableObject {
             (UInt32(bytes[start + 3]) << 24)
     }
 
-    private func upsertToday(steps: Int, calories: Int) {
+    private func upsertToday(steps: Int) {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
+        let derivedCalories = calories(for: steps)
         if let i = activityDays.firstIndex(where: { cal.isDate($0.date, inSameDayAs: today) }) {
-            activityDays[i] = ActivityDay(date: today, steps: steps, calories: calories)
+            activityDays[i] = ActivityDay(date: today, steps: steps, calories: derivedCalories)
         } else {
-            activityDays.append(ActivityDay(date: today, steps: steps, calories: calories))
+            activityDays.append(ActivityDay(date: today, steps: steps, calories: derivedCalories))
         }
         activityDays.sort { $0.date > $1.date }
         saveStoredDays()
@@ -263,81 +269,61 @@ final class BLEManager: NSObject, ObservableObject {
 extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothReady = central.state == .poweredOn
-        switch central.state {
-        case .poweredOn: status = "Bluetooth kész. Keresd meg az AVIATOR órát."
-        case .poweredOff: status = "Kapcsold be a Bluetooth-t a Macen."
-        case .unauthorized: status = "A macOS nem engedélyezte a Bluetooth-hozzáférést."
-        case .unsupported: status = "Ez a Mac nem támogatja a szükséges Bluetooth LE funkciót."
-        case .resetting: status = "Bluetooth újraindul…"
-        default: status = "Bluetooth inicializálása…"
-        }
+        if bluetoothReady { status = "Bluetooth kész" }
+        else { status = "Bluetooth nem elérhető (állapot: \(central.state.rawValue))" }
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didDiscover peripheral: CBPeripheral,
-                        advertisementData: [String : Any],
-                        rssi RSSI: NSNumber) {
-        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        let name = peripheral.name ?? advertisedName ?? "Névtelen BLE eszköz"
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Névtelen BLE eszköz"
         upsert(peripheral, name: name, rssi: RSSI.intValue)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        manualDisconnect = false
-        reconnectPeripheral = peripheral
         connectedPeripheral = peripheral
-        peripheral.delegate = self
         connectedID = peripheral.identifier
-        status = "Csatlakozva. AVIATOR BLE szolgáltatás keresése…"
-        peripheral.discoverServices(nil)
+        manualDisconnect = false
+        status = "Csatlakozva. Szolgáltatások keresése…"
+        peripheral.delegate = self
+        peripheral.discoverServices([serviceUUID])
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didFailToConnect peripheral: CBPeripheral,
-                        error: Error?) {
-        connectedID = nil
-        status = "Nem sikerült csatlakozni: \(error?.localizedDescription ?? "ismeretlen hiba")"
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        connectedID = nil; canSync = false
+        status = "Csatlakozási hiba: \(error?.localizedDescription ?? "ismeretlen")"
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didDisconnectPeripheral peripheral: CBPeripheral,
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        connectedID = nil
-        writeCharacteristic = nil
-        notifyCharacteristic = nil
-        canSync = false
-        connectedPeripheral = nil
-
+        connectedID = nil; canSync = false
+        connectedPeripheral = nil; writeCharacteristic = nil; notifyCharacteristic = nil
+        awaitingCurrentStatus = false
         if manualDisconnect {
-            status = "Az óra lecsatlakoztatva."
+            status = "Az óra kézzel lecsatlakoztatva."
             return
         }
-
-        status = "Bluetooth kapcsolat megszakadt. Újracsatlakozás…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak peripheral] in
-            guard let self, let peripheral, !self.manualDisconnect else { return }
-            self.connectedPeripheral = peripheral
-            peripheral.delegate = self
-            self.central.connect(peripheral, options: nil)
+        status = "Kapcsolat megszakadt. Újracsatlakozás…"
+        let target = reconnectPeripheral ?? peripheral
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak target] in
+            guard let self, let target, !self.manualDisconnect else { return }
+            self.connectedPeripheral = target
+            target.delegate = self
+            self.central.connect(target, options: nil)
         }
     }
 }
 
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error { status = "Szolgáltatás-keresési hiba: \(error.localizedDescription)"; return }
+        guard error == nil else { status = "Szolgáltatás hiba: \(error!.localizedDescription)"; return }
         guard let services = peripheral.services else { return }
-        if let service = services.first(where: { $0.uuid == serviceUUID }) {
-            peripheral.discoverCharacteristics([writeUUID, notifyUUID], for: service)
-        } else {
-            status = "Az AVIATOR BLE szolgáltatás nem található."
+        for s in services where s.uuid == serviceUUID {
+            peripheral.discoverCharacteristics([writeUUID, notifyUUID], for: s)
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
-                    didDiscoverCharacteristicsFor service: CBService,
-                    error: Error?) {
-        if let error { status = "Karakterisztika-hiba: \(error.localizedDescription)"; return }
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard error == nil else { status = "Karakterisztika hiba: \(error!.localizedDescription)"; return }
         for c in service.characteristics ?? [] {
             if c.uuid == writeUUID { writeCharacteristic = c }
             if c.uuid == notifyUUID {
@@ -345,15 +331,12 @@ extension BLEManager: CBPeripheralDelegate {
                 peripheral.setNotifyValue(true, for: c)
             }
         }
-        canSync = writeCharacteristic != nil
-        status = canSync ? "AVIATOR csatlakoztatva." : "Az írási csatorna nem található."
+        canSync = writeCharacteristic != nil && notifyCharacteristic != nil
+        if canSync { status = "✓ AVIATOR Mark 1 készen áll." }
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
-                    didUpdateValueFor characteristic: CBCharacteristic,
-                    error: Error?) {
-        if let error { log("RX hiba: \(error.localizedDescription)"); return }
-        guard characteristic.uuid == notifyUUID, let data = characteristic.value else { return }
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard error == nil, let data = characteristic.value else { return }
         handleNotification(data)
     }
 }
