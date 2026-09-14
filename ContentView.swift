@@ -57,9 +57,9 @@ struct ContentView: View {
             }
             HStack(spacing: 12) {
                 summaryCard(title: "Akkumulátor", value: ble.batteryLevel.map { "\($0)%" } ?? "–", icon: "battery.75")
-                summaryCard(title: "Mai lépések", value: todayActivity.map { "\($0.steps)" } ?? "–", icon: "figure.walk")
-                summaryCard(title: "Mai távolság", value: todayActivity.map { String(format: "%.2f km", ble.distanceKm(for: $0.steps)) } ?? "–", icon: "location")
-                summaryCard(title: "Mai kalória", value: todayActivity.map { "\($0.calories) kcal" } ?? "–", icon: "flame")
+                summaryCard(title: activityCardPrefix + " lépések", value: displayActivity.map { "\($0.steps)" } ?? "–", icon: "figure.walk")
+                summaryCard(title: activityCardPrefix + " távolság", value: displayActivity.map { String(format: "%.2f km", ble.distanceKm(for: $0.steps)) } ?? "–", icon: "location")
+                summaryCard(title: activityCardPrefix + " kalória", value: displayActivity.map { String(format: "%.1f kcal", Double($0.calories) / 1000.0) } ?? "–", icon: "flame")
             }
             HStack {
                 Text("Lépéshossz:").foregroundStyle(.secondary)
@@ -95,7 +95,7 @@ struct ContentView: View {
             HStack { Text("Aktivitási előzmények").font(.title2.bold()); Spacer(); Text("\(ble.totalStoredDays) nap").foregroundStyle(.secondary) }
             GroupBox {
                 if ble.activityDays.isEmpty { Text("Még nincs letöltött aktivitási adat.").foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding() }
-                else { List(ble.activityDays) { day in HStack { Text(day.date.formatted(date: .numeric, time: .omitted)).frame(maxWidth: .infinity, alignment: .leading); Text("\(day.steps)").frame(width: 100, alignment: .trailing); Text(String(format: "%.2f km", ble.distanceKm(for: day.steps))).frame(width: 110, alignment: .trailing); Text("\(day.calories) kcal").frame(width: 100, alignment: .trailing) } } }
+                else { List(ble.activityDays) { day in HStack { Text(day.date.formatted(date: .numeric, time: .omitted)).frame(maxWidth: .infinity, alignment: .leading); Text("\(day.steps)").frame(width: 100, alignment: .trailing); Text(String(format: "%.2f km", ble.distanceKm(for: day.steps))).frame(width: 110, alignment: .trailing); Text(String(format: "%.1f kcal", Double(day.calories) / 1000.0)).frame(width: 100, alignment: .trailing) } } }
             }
             statusLine
         }.padding(.top, 8)
@@ -109,7 +109,7 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 summaryCard(title: "Összes lépés", value: "\(days.reduce(0){$0+$1.steps})", icon: "figure.walk")
                 summaryCard(title: "Összes távolság", value: String(format: "%.2f km", days.reduce(0.0){$0+ble.distanceKm(for:$1.steps)}), icon: "location")
-                summaryCard(title: "Összes kalória", value: "\(days.reduce(0){$0+$1.calories}) kcal", icon: "flame")
+                summaryCard(title: "Összes kalória", value: String(format: "%.1f kcal", Double(days.reduce(0){$0+$1.calories}) / 1000.0), icon: "flame")
             }
             GroupBox { PrettyBarChart(days: filledChartDays, metric: chartMetric, distanceProvider: ble.distanceKm(for:)).frame(minHeight: 360).padding(12) }
             statusLine
@@ -139,15 +139,22 @@ struct ContentView: View {
     }
     private var statusLine: some View { Text(ble.status).frame(maxWidth: .infinity, alignment: .leading).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
     private var todayActivity: ActivityDay? { ble.activityDays.first { Calendar.current.isDateInToday($0.date) } }
-    private var chartDays: [ActivityDay] { let c=Calendar.current, t=c.startOfDay(for:Date()), cut=c.date(byAdding:.day,value:-(chartRange.rawValue-1),to:t) ?? t; return ble.activityDays.filter{$0.date>=cut && $0.date<=t}.sorted{$0.date<$1.date} }
-    private var filledChartDays: [ActivityDay] { let c=Calendar.current, t=c.startOfDay(for:Date()); return (0..<chartRange.rawValue).reversed().compactMap { n in guard let d=c.date(byAdding:.day,value:-n,to:t) else{return nil}; let found=ble.activityDays.first{c.isDate($0.date,inSameDayAs:d)}; return found ?? ActivityDay(date:d,steps:0,calories:0) } }
+    private var displayActivity: ActivityDay? { todayActivity ?? ble.activityDays.first }
+    private var activityCardPrefix: String { todayActivity != nil ? "Mai" : "Legutóbbi" }
+
+    // A Mark 1 régi, az órában tárolt rekordokat is visszaad. Ha nincs aktuális dátumú
+    // rekord, a grafikon akkor is a legutóbbi 7/30 eltárolt napot mutatja, nem üres mezőt.
+    private var chartDays: [ActivityDay] {
+        Array(ble.activityDays.prefix(chartRange.rawValue)).sorted { $0.date < $1.date }
+    }
+    private var filledChartDays: [ActivityDay] { chartDays }
 }
 
 private struct PrettyBarChart: View {
     let days:[ActivityDay]; let metric:ActivityMetric; let distanceProvider:(Int)->Double
-    private func val(_ d:ActivityDay)->Double { switch metric { case .steps:return Double(d.steps); case .distance:return distanceProvider(d.steps); case .calories:return Double(d.calories) } }
+    private func val(_ d:ActivityDay)->Double { switch metric { case .steps:return Double(d.steps); case .distance:return distanceProvider(d.steps); case .calories:return Double(d.calories) / 1000.0 } }
     private var maxV:Double { max(days.map(val).max() ?? 0, metric == .steps ? 1000 : 1) }
-    private func text(_ v:Double)->String { switch metric { case .steps:return String(Int(v)); case .distance:return String(format:"%.2f",v); case .calories:return String(Int(v)) } }
+    private func text(_ v:Double)->String { switch metric { case .steps:return String(Int(v)); case .distance:return String(format:"%.2f",v); case .calories:return String(format:"%.1f",v) } }
     var body: some View {
         GeometryReader { g in
             let dense=days.count>10, barW:CGFloat=dense ? 14 : 54, plotH=max(g.size.height-55,1)
