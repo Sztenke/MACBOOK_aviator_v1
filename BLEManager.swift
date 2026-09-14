@@ -8,14 +8,7 @@ struct BLEDevice: Identifiable {
     var id: UUID { peripheral.identifier }
 }
 
-struct ActivityRecord: Codable, Hashable {
-    let rawTimestamp: UInt32
-    let date: Date
-    let steps: Int
-    let calories: Int
-}
-
-struct ActivityDay: Identifiable, Hashable {
+struct ActivityDay: Identifiable, Codable, Hashable {
     let date: Date
     let steps: Int
     let calories: Int
@@ -29,11 +22,10 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var connectedID: UUID?
     @Published var bluetoothReady = false
     @Published var canSync = false
-    @Published var isActivitySyncing = false
-    @Published var batteryLevel: Int? = nil
+    @Published var batteryLevel: Int?
     @Published var activityDays: [ActivityDay] = []
     @Published var diagnosticLog: [String] = []
-    @Published var strideLengthCm: Double = 75.0 {
+    @Published var strideLengthCm: Double = 50.0 {
         didSet {
             let safe = min(max(strideLengthCm, 30), 150)
             if safe != strideLengthCm { strideLengthCm = safe }
@@ -50,25 +42,19 @@ final class BLEManager: NSObject, ObservableObject {
     private let writeUUID = CBUUID(string: "00008001-0000-1000-8000-00805F9B34FB")
     private let notifyUUID = CBUUID(string: "00008002-0000-1000-8000-00805F9B34FB")
 
-    private var recordsByTimestamp: [UInt32: ActivityRecord] = [:]
-    private var currentTodaySteps: Int?
-    private var currentTodayCalories: Int?
-    private var awaitingCurrentTotals = false
-    private var awaitingBattery = false
+    // A működő verzió kulcsa: 0x1B kérést küldünk, a Mark 1 pedig
+    // 20 bájtos 0x0F válaszban adja vissza a napi aktuális állapotot.
+    private var awaitingCurrentStatus = false
     private var manualDisconnect = false
     private var reconnectPeripheral: CBPeripheral?
-    private var sportRequestCount = 0
-    private let maxSportRequests = 1200
-    // Egy szinkron alatt ide gyűjtjük az órától érkező rekordokat.
-    // Csak a legutóbbi 7 nap kerül be a helyi adatbázisba a szinkron végén.
-    private var pendingWeekRecords: [UInt32: ActivityRecord] = [:]
-    private let recordsDefaultsKey = "aviator.activityRecords.v3"
+
+    private let dayStoreKey = "aviator.activityDays.v4"
 
     override init() {
         super.init()
         let savedStride = UserDefaults.standard.double(forKey: "strideLengthCm")
         if savedStride >= 30 && savedStride <= 150 { strideLengthCm = savedStride }
-        loadStoredActivity()
+        loadStoredDays()
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
@@ -102,18 +88,9 @@ final class BLEManager: NSObject, ObservableObject {
         central.connect(peripheral, options: nil)
     }
 
-    func syncTime() {
-        guard canWrite else {
-            status = "Előbb csatlakozz az AVIATOR órához."
-            return
-        }
-        sendTimePacket()
-    }
-
     func disconnect() {
         manualDisconnect = true
         reconnectPeripheral = nil
-        isActivitySyncing = false
         guard let peripheral = connectedPeripheral else {
             status = "Nincs csatlakoztatott óra."
             return
@@ -122,53 +99,46 @@ final class BLEManager: NSObject, ObservableObject {
         status = "Bluetooth kapcsolat bontása…"
     }
 
+    func syncTime() {
+        guard canWrite else {
+            status = "Előbb csatlakozz az AVIATOR órához."
+            return
+        }
+        let now = Date()
+        let cal = Calendar.current
+        let year = cal.component(.year, from: now)
+        let bytes: [UInt8] = [
+            0x6E, 0x01, 0x15,
+            UInt8(year & 0xff), UInt8((year >> 8) & 0xff),
+            UInt8(cal.component(.month, from: now)),
+            UInt8(cal.component(.day, from: now)),
+            UInt8(cal.component(.hour, from: now)),
+            UInt8(cal.component(.minute, from: now)),
+            UInt8(cal.component(.second, from: now)),
+            0x8F
+        ]
+        sendCommand(bytes, label: "idő")
+        status = "✓ Idő szinkronizálva."
+    }
+
     func syncData() {
         guard canWrite else {
             status = "Előbb csatlakozz az AVIATOR órához."
             return
         }
-        // A Mark 1 0x0F válasza a jelenlegi napi állapotot is tartalmazza.
-        // Nem indítunk többé részletes rekord-letöltési ciklust, mert az óra
-        // régi, 2021–2022-es rekordokat ad vissza sorban, ami feleslegesen
-        // terheli a BLE kapcsolatot és nem a mai állapotot mutatja.
-        awaitingBattery = true
-        awaitingCurrentTotals = true
-        sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akku + mai aktivitás")
-        status = "Akkumulátor és mai aktivitási adatok lekérése…"
-    }
+        awaitingCurrentStatus = true
 
-    func syncTimeAndActivity() {
-        guard canWrite else {
-            status = "Előbb csatlakozz az AVIATOR órához."
-            return
-        }
-        sendTimePacket()
-        status = "Idő elküldve. Aktivitási adatok lekérése indul…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-            self?.startActivitySync()
-        }
-    }
+        // FONTOS: ez a működő régi verzió parancsa.
+        // Nem 0x0F-et kérünk közvetlenül. A 0x1B kérésre érkezik a
+        // 20 bájtos 0x0F állapotcsomag, benne a napi lépésszámmal.
+        sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi aktuális állapot")
+        status = "Mai lépésszám és akkumulátor lekérése…"
 
-    func startActivitySync() {
-        guard canWrite else {
-            status = "Előbb csatlakozz az AVIATOR órához."
-            return
-        }
-        isActivitySyncing = true
-        sportRequestCount = 0
-        pendingWeekRecords.removeAll()
-        currentTodaySteps = nil
-        currentTodayCalories = nil
-        awaitingCurrentTotals = true
-        log("Heti aktivitás-szinkron indítása")
-
-        // Eredeti Mark 1 app: getSportDataTotal
-        sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi összesítő")
-
-        // A v3.1-ben működő Mark 1 aktivitás-lekérés visszaállítva.
-        // A napi összesítő után részletes rekordokat kérünk, ugyanúgy mint a működő verzióban.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-            self?.requestNextSportRecord()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self, self.awaitingCurrentStatus else { return }
+            self.awaitingCurrentStatus = false
+            self.status = "Nem érkezett értelmezhető napi állapotválasz."
+            self.log("Napi állapot időtúllépés")
         }
     }
 
@@ -176,48 +146,22 @@ final class BLEManager: NSObject, ObservableObject {
         Double(steps) * strideLengthCm / 100_000.0
     }
 
-    var totalStoredDays: Int { activityDays.count }
-
-    private var canWrite: Bool {
-        connectedPeripheral != nil && writeCharacteristic != nil
-    }
-
-    private func sendTimePacket() {
-        let now = Date()
+    var currentMonthDays: [ActivityDay] {
         let cal = Calendar.current
-        let year = cal.component(.year, from: now)
-        let month = cal.component(.month, from: now)
-        let day = cal.component(.day, from: now)
-        let hour = cal.component(.hour, from: now)
-        let minute = cal.component(.minute, from: now)
-        let second = cal.component(.second, from: now)
-
-        let bytes: [UInt8] = [
-            0x6E, 0x01, 0x15,
-            UInt8(year & 0xff), UInt8((year >> 8) & 0xff),
-            UInt8(month), UInt8(day), UInt8(hour), UInt8(minute), UInt8(second),
-            0x8F
-        ]
-        sendCommand(bytes, label: "idő")
-        status = String(format: "Időcsomag elküldve: %04d-%02d-%02d %02d:%02d:%02d",
-                        year, month, day, hour, minute, second)
+        let now = Date()
+        let comps = cal.dateComponents([.year, .month], from: now)
+        guard let monthStart = cal.date(from: comps),
+              let nextMonth = cal.date(byAdding: .month, value: 1, to: monthStart) else { return [] }
+        return activityDays.filter { $0.date >= monthStart && $0.date < nextMonth }
+            .sorted { $0.date < $1.date }
     }
 
-    private func requestNextSportRecord() {
-        guard isActivitySyncing else { return }
-        guard sportRequestCount < maxSportRequests else {
-            finishActivitySync(message: "A lekérés biztonsági limitnél megállt.")
-            return
-        }
-        sportRequestCount += 1
-        sendCommand([0x6E, 0x01, 0x06, 0x01, 0x8F], label: "aktivitás rekord #\(sportRequestCount)")
-    }
+    private var canWrite: Bool { connectedPeripheral != nil && writeCharacteristic != nil }
 
     private func sendCommand(_ bytes: [UInt8], label: String) {
         guard let peripheral = connectedPeripheral,
               let characteristic = writeCharacteristic else { return }
-        let type: CBCharacteristicWriteType =
-            characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
+        let type: CBCharacteristicWriteType = characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
         peripheral.writeValue(Data(bytes), for: characteristic, type: type)
         log("TX \(label): \(hex(bytes))")
     }
@@ -226,238 +170,74 @@ final class BLEManager: NSObject, ObservableObject {
         let bytes = [UInt8](data)
         guard !bytes.isEmpty else { return }
         log("RX: \(hex(bytes))")
-
-        // A Mark 1 válaszcsomagok 0x6E fejléccel és 0x8F lezárással érkeznek.
         guard bytes.first == 0x6E, bytes.last == 0x8F else { return }
 
-        // Mark 1 akkumulátor-válasz. A korábbi hibás kód az első 0...100 közötti
-        // bájtot százaléknak vette, ezért a 0x28 értéket tévesen 40%-nak mutatta.
-        // Ennél a Mark 1-nél ez töltöttségi/voltage kód: a teljesen feltöltött órán 0x28 (40).
-        // 32..40 tartományt skálázunk 0..100%-ra; 40 vagy fölötte = 100%.
-        if bytes.count == 20 && bytes[2] == 0x0F {
-            // Mark 1: a 0x0F válasz nem csak akkukódot ad vissza.
-            // A tesztórán a [11...14] little-endian mező pontosan a számlapon
-            // látható aktuális napi lépésszámot tartalmazza (pl. 0x0A3C = 2620).
-            let rawBattery = Int(bytes[3])
-            let percent: Int
-            if rawBattery >= 40 {
-                percent = 100
-            } else if rawBattery <= 32 {
-                percent = 0
-            } else {
-                percent = min(100, max(0, Int((Double(rawBattery - 32) / 8.0 * 100.0).rounded())))
-            }
-            batteryLevel = percent
+        // A régi működő app logikáját tartjuk meg: amíg napi állapotot várunk,
+        // az első 20 bájtos Mark 1 csomagot értelmezzük. A gyakorlatban a
+        // 0x1B kérésre 0x0F típusú, 20 bájtos válasz érkezik.
+        guard awaitingCurrentStatus, bytes.count == 20 else { return }
+        awaitingCurrentStatus = false
 
-            let todayCalories = Int(leUInt32(bytes, 7))
-            let todaySteps = Int(leUInt32(bytes, 11))
-            if todaySteps >= 0 && todaySteps < 500_000 {
-                currentTodaySteps = todaySteps
-                currentTodayCalories = max(0, min(todayCalories, 100_000))
-                saveTodaySnapshot(steps: todaySteps, calories: currentTodayCalories ?? 0)
-                log("Mai állapot: \(todaySteps) lépés, \(currentTodayCalories ?? 0) kcal, akku \(percent)%")
-            } else {
-                log("Mai lépésszám nem értelmezhető: \(todaySteps)")
-            }
-            awaitingBattery = false
-            awaitingCurrentTotals = false
-            isActivitySyncing = false
-            rebuildActivityDays()
-            status = "✓ Mai adatok szinkronizálva."
+        let caloriesRaw = Int(leUInt32(bytes, 7))
+        let steps = Int(leUInt32(bytes, 11))
+
+        guard steps >= 0 && steps < 500_000 else {
+            status = "A lépésszám válasza nem értelmezhető."
+            log("Hibás napi lépésszám: \(steps)")
             return
         }
 
-        // Napi aktuális összesítő. A gyári appban a 20 bájtos válaszból:
-        // [7...10] = calories, [11...14] = steps (little endian).
-        if awaitingCurrentTotals && bytes.count == 20 && bytes[2] == 0x1B {
-            let calories = Int(leUInt32(bytes, 7))
-            let steps = Int(leUInt32(bytes, 11))
-            if steps >= 0 && steps < 500_000 && calories >= 0 && calories < 100_000 {
-                currentTodaySteps = steps
-                currentTodayCalories = calories
-                log("Mai összesítő: \(steps) lépés, \(calories) kcal")
-                rebuildActivityDays()
-            }
-            awaitingCurrentTotals = false
-            return
-        }
+        // Mark 1 tesztóra: teljes töltésnél a kód 0x28. A firmware nem küld
+        // külön 0–100 értéket, ezért a 0x20...0x28 tartományt százalékra skálázzuk.
+        let rawBattery = Int(bytes[3])
+        let battery = batteryPercent(from: rawBattery)
+        batteryLevel = battery
 
-        // Sport detail rekord: 19 bájt; a gyári app SportsData objektumot készít belőle.
-        if bytes.count == 19 && bytes.count > 18 && bytes[2] == 0x05 {
-            let payloadIsZero = bytes[4...15].allSatisfy { $0 == 0 }
-            if bytes[3] == 0x06 && payloadIsZero {
-                finishActivitySync(message: "✓ Aktivitási adatok szinkronizálva.")
-                return
-            }
+        // A napi összesítő kcal mezőjét a korábbi verzió túl nagy számmal mutatta;
+        // százados skálán jelenítjük meg, és egész kcal-ként mentjük.
+        let calories = max(0, min(100_000, Int((Double(caloriesRaw) / 100.0).rounded())))
 
-            let rawTime = leUInt32(bytes, 4)
-            let steps = Int(leUInt32(bytes, 8))
-            let calories = Int(leUInt32(bytes, 12))
-
-            if let date = decodeWatchDate(rawTime),
-               steps >= 0, steps < 500_000,
-               calories >= 0, calories < 100_000 {
-                let record = ActivityRecord(rawTimestamp: rawTime,
-                                            date: date,
-                                            steps: steps,
-                                            calories: calories)
-                // Nem írjuk azonnal a helyi adatbázisba. A Mark 1 régi rekordokat is
-                // visszaad, ezért egy ideiglenes pufferbe gyűjtünk, majd a végén
-                // csak az óra által visszaadott legfrissebb 7 napot mentjük.
-                pendingWeekRecords[rawTime] = record
-                log("Rekord: \(date.formatted()) | \(steps) lépés | \(calories) kcal")
-            } else {
-                log("Nem értelmezhető sport rekord; rawTime=\(rawTime), steps=\(steps), cal=\(calories)")
-            }
-
-            // A működő v3.1 viselkedése: folytatjuk a Mark 1 sportrekordok lekérését.
-            // Kis késleltetéssel kíméljük a BLE kapcsolatot.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
-                self?.requestNextSportRecord()
-            }
-            return
-        }
-
-        // Néhány firmware a befejező választ rövidebb csomagban küldheti.
-        if isActivitySyncing && bytes.count <= 8 && bytes.contains(0x06) {
-            finishActivitySync(message: "✓ Aktivitási adatok szinkronizálva.")
-        }
+        upsertToday(steps: steps, calories: calories)
+        status = "✓ Mai adatok frissítve: \(steps) lépés, akku \(battery)%"
+        log("Mai állapot: \(steps) lépés | \(calories) kcal | akku \(battery)% (raw 0x\(String(format: "%02X", rawBattery)))")
     }
 
-    private func finishActivitySync(message: String) {
-        isActivitySyncing = false
-        awaitingCurrentTotals = false
-        mergeLatestWeekWithoutOverwritingHistory()
-        rebuildActivityDays()
-        status = message + " A legutóbbi heti adatok frissítve. \(activityDays.count) nap helyben eltárolva."
-        log(status)
-    }
-
-    /// Az órából egy szinkron alatt érkező rekordok közül csak a legfrissebb 7 napot
-    /// vesszük át. A már korábban eltárolt, lezárt napokat nem írjuk felül.
-    /// A mai nap kivétel: annak értékei a nap folyamán növekedhetnek.
-    private func mergeLatestWeekWithoutOverwritingHistory() {
-        guard !pendingWeekRecords.isEmpty else { return }
-        let cal = Calendar.current
-        guard let newestDate = pendingWeekRecords.values.map({ $0.date }).max() else { return }
-        let newestDay = cal.startOfDay(for: newestDate)
-        guard let weekStart = cal.date(byAdding: .day, value: -6, to: newestDay) else { return }
-        let today = cal.startOfDay(for: Date())
-
-        // Mely napok vannak már helyben? A mai napot nem tekintjük lezártnak.
-        let existingClosedDays = Set(recordsByTimestamp.values.map { cal.startOfDay(for: $0.date) }.filter { $0 < today })
-
-        var added = 0
-        var skippedOld = 0
-        var skippedExisting = 0
-        for (raw, record) in pendingWeekRecords {
-            let day = cal.startOfDay(for: record.date)
-            guard day >= weekStart && day <= newestDay else {
-                skippedOld += 1
-                continue
-            }
-            if day < today && existingClosedDays.contains(day) {
-                skippedExisting += 1
-                continue
-            }
-            // Ugyanazt a félórás rekordot sem írjuk felül, ha már megvan.
-            if recordsByTimestamp[raw] == nil {
-                recordsByTimestamp[raw] = record
-                added += 1
-            }
-        }
-        saveStoredActivity()
-        log("Heti mentés: +\(added) rekord, \(skippedOld) hétnél régebbi kihagyva, \(skippedExisting) korábbi nap változatlan.")
-        pendingWeekRecords.removeAll()
+    private func batteryPercent(from raw: Int) -> Int {
+        if raw >= 0x28 { return 100 }
+        if raw <= 0x20 { return 0 }
+        return Int((Double(raw - 0x20) / Double(0x28 - 0x20) * 100.0).rounded())
     }
 
     private func leUInt32(_ bytes: [UInt8], _ start: Int) -> UInt32 {
         guard start >= 0, start + 3 < bytes.count else { return 0 }
         return UInt32(bytes[start]) |
-               (UInt32(bytes[start + 1]) << 8) |
-               (UInt32(bytes[start + 2]) << 16) |
-               (UInt32(bytes[start + 3]) << 24)
+            (UInt32(bytes[start + 1]) << 8) |
+            (UInt32(bytes[start + 2]) << 16) |
+            (UInt32(bytes[start + 3]) << 24)
     }
 
-    private func decodeWatchDate(_ raw: UInt32) -> Date? {
-        let candidates = [
-            Date(timeIntervalSince1970: TimeInterval(raw)),
-            Date(timeIntervalSince1970: TimeInterval(raw) + 946_684_800) // 2000-01-01 epoch fallback
-        ]
-        let calendar = Calendar.current
-        return candidates.first {
-            let y = calendar.component(.year, from: $0)
-            return y >= 2015 && y <= 2100
-        }
-    }
-
-    private func rebuildActivityDays() {
-        let cal = Calendar.current
-        var grouped: [Date: (steps: Int, calories: Int)] = [:]
-
-        for record in recordsByTimestamp.values {
-            let day = cal.startOfDay(for: record.date)
-            let old = grouped[day] ?? (0, 0)
-            grouped[day] = (old.steps + record.steps, old.calories + record.calories)
-        }
-
-        // A jelenlegi nap összesítője abszolút napi érték; ha nagyobb a részrekordok
-        // összegénél, ezt tekintjük a legfrissebb mai értéknek.
-        if let steps = currentTodaySteps, let calories = currentTodayCalories {
-            let today = cal.startOfDay(for: Date())
-            let old = grouped[today] ?? (0, 0)
-            grouped[today] = (max(old.steps, steps), max(old.calories, calories))
-        }
-
-        activityDays = grouped.map { ActivityDay(date: $0.key, steps: $0.value.steps, calories: $0.value.calories) }
-            .sorted { $0.date > $1.date }
-    }
-
-    /// A mai nap egyetlen összesített pillanatképét tároljuk. Csak a mai nap
-    /// írható felül; minden korábbi nap változatlan marad.
-    private func saveTodaySnapshot(steps: Int, calories: Int) {
+    private func upsertToday(steps: Int, calories: Int) {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
-
-        // Csak a mai naphoz tartozó korábbi pillanatképet/részrekordot cseréljük.
-        // Tegnapi és régebbi adatot soha nem írunk felül.
-        let todayKeys = recordsByTimestamp.compactMap { key, value in
-            cal.isDate(value.date, inSameDayAs: today) ? key : nil
+        if let i = activityDays.firstIndex(where: { cal.isDate($0.date, inSameDayAs: today) }) {
+            activityDays[i] = ActivityDay(date: today, steps: steps, calories: calories)
+        } else {
+            activityDays.append(ActivityDay(date: today, steps: steps, calories: calories))
         }
-        for key in todayKeys { recordsByTimestamp.removeValue(forKey: key) }
-
-        let dayKey = UInt32(max(0, Int(today.timeIntervalSince1970)))
-        recordsByTimestamp[dayKey] = ActivityRecord(rawTimestamp: dayKey,
-                                                    date: today,
-                                                    steps: steps,
-                                                    calories: calories)
-        saveStoredActivity()
+        activityDays.sort { $0.date > $1.date }
+        saveStoredDays()
     }
 
-    private func saveStoredActivity() {
-        let records = Array(recordsByTimestamp.values)
-        if let data = try? JSONEncoder().encode(records) {
-            UserDefaults.standard.set(data, forKey: recordsDefaultsKey)
+    private func loadStoredDays() {
+        guard let data = UserDefaults.standard.data(forKey: dayStoreKey),
+              let saved = try? JSONDecoder().decode([ActivityDay].self, from: data) else { return }
+        activityDays = saved.sorted { $0.date > $1.date }
+    }
+
+    private func saveStoredDays() {
+        if let data = try? JSONEncoder().encode(activityDays) {
+            UserDefaults.standard.set(data, forKey: dayStoreKey)
         }
-    }
-
-    private func loadStoredActivity() {
-        guard let data = UserDefaults.standard.data(forKey: recordsDefaultsKey),
-              let records = try? JSONDecoder().decode([ActivityRecord].self, from: data) else {
-            return
-        }
-        recordsByTimestamp = Dictionary(uniqueKeysWithValues: records.map { ($0.rawTimestamp, $0) })
-        rebuildActivityDays()
-    }
-
-    private func log(_ text: String) {
-        let stamp = Date().formatted(date: .omitted, time: .standard)
-        diagnosticLog.append("[\(stamp)] \(text)")
-        if diagnosticLog.count > 300 { diagnosticLog.removeFirst(diagnosticLog.count - 300) }
-    }
-
-    private func hex(_ bytes: [UInt8]) -> String {
-        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 
     private func upsert(_ peripheral: CBPeripheral, name: String, rssi: Int) {
@@ -467,6 +247,16 @@ final class BLEManager: NSObject, ObservableObject {
             devices.append(BLEDevice(peripheral: peripheral, name: name, rssi: rssi))
             devices.sort { $0.rssi > $1.rssi }
         }
+    }
+
+    private func log(_ text: String) {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        diagnosticLog.append("[\(f.string(from: Date()))] \(text)")
+        if diagnosticLog.count > 250 { diagnosticLog.removeFirst(diagnosticLog.count - 250) }
+    }
+
+    private func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 }
 
@@ -516,23 +306,16 @@ extension BLEManager: CBCentralManagerDelegate {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         canSync = false
-        isActivitySyncing = false
         connectedPeripheral = nil
 
         if manualDisconnect {
-            batteryLevel = nil
-            status = "Az óra kézzel lecsatlakoztatva."
-            log(status)
+            status = "Az óra lecsatlakoztatva."
             return
         }
 
-        // Váratlan kapcsolatvesztésnél automatikus visszacsatlakozás.
-        reconnectPeripheral = peripheral
-        status = "Bluetooth kapcsolat megszakadt. Automatikus újracsatlakozás…"
-        log(status + (error.map { " (\($0.localizedDescription))" } ?? ""))
+        status = "Bluetooth kapcsolat megszakadt. Újracsatlakozás…"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak peripheral] in
-            guard let self, let peripheral, !self.manualDisconnect,
-                  self.central.state == .poweredOn else { return }
+            guard let self, let peripheral, !self.manualDisconnect else { return }
             self.connectedPeripheral = peripheral
             peripheral.delegate = self
             self.central.connect(peripheral, options: nil)
@@ -542,65 +325,35 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error {
-            status = "Service keresési hiba: \(error.localizedDescription)"
-            return
-        }
-        guard let services = peripheral.services else {
-            status = "A csatlakoztatott eszköz nem adott vissza BLE szolgáltatásokat."
-            return
-        }
-        if let aviatorService = services.first(where: { $0.uuid == serviceUUID }) {
-            status = "AVIATOR 6006 service megtalálva. Karakterisztikák keresése…"
-            peripheral.discoverCharacteristics(nil, for: aviatorService)
+        if let error { status = "Szolgáltatás-keresési hiba: \(error.localizedDescription)"; return }
+        guard let services = peripheral.services else { return }
+        if let service = services.first(where: { $0.uuid == serviceUUID }) {
+            peripheral.discoverCharacteristics([writeUUID, notifyUUID], for: service)
         } else {
-            let found = services.map { $0.uuid.uuidString }.joined(separator: ", ")
-            status = "Csatlakozott, de a 6006 AVIATOR service nincs rajta. Talált service-ek: \(found)"
+            status = "Az AVIATOR BLE szolgáltatás nem található."
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        if let error {
-            status = "Karakterisztika keresési hiba: \(error.localizedDescription)"
-            return
-        }
-        for characteristic in service.characteristics ?? [] {
-            if characteristic.uuid == writeUUID { writeCharacteristic = characteristic }
-            if characteristic.uuid == notifyUUID {
-                notifyCharacteristic = characteristic
-                if characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
-                    peripheral.setNotifyValue(true, for: characteristic)
-                }
+        if let error { status = "Karakterisztika-hiba: \(error.localizedDescription)"; return }
+        for c in service.characteristics ?? [] {
+            if c.uuid == writeUUID { writeCharacteristic = c }
+            if c.uuid == notifyUUID {
+                notifyCharacteristic = c
+                peripheral.setNotifyValue(true, for: c)
             }
         }
-        if writeCharacteristic != nil {
-            canSync = true
-            status = "AVIATOR kommunikáció kész."
-        } else {
-            let found = (service.characteristics ?? []).map { $0.uuid.uuidString }.joined(separator: ", ")
-            status = "A 8001 írási karakterisztika nem található. Talált karakterisztikák: \(found)"
-        }
+        canSync = writeCharacteristic != nil
+        status = canSync ? "AVIATOR csatlakoztatva." : "Az írási csatorna nem található."
     }
 
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        if let error {
-            log("Notify hiba: \(error.localizedDescription)")
-            return
-        }
+        if let error { log("RX hiba: \(error.localizedDescription)"); return }
         guard characteristic.uuid == notifyUUID, let data = characteristic.value else { return }
         handleNotification(data)
-    }
-
-    func peripheral(_ peripheral: CBPeripheral,
-                    didWriteValueFor characteristic: CBCharacteristic,
-                    error: Error?) {
-        if let error {
-            status = "Bluetooth írási hiba: \(error.localizedDescription)"
-            log(status)
-        }
     }
 }
