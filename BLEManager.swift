@@ -27,10 +27,9 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var activityDays: [ActivityDay] = []
     @Published var diagnosticLog: [String] = []
 
-    // Ezeket egyszer az óra kijelzett értékeihez kalibráljuk.
-    @Published var distancePerStepKm: Double = 0.0005 {
-        didSet { UserDefaults.standard.set(distancePerStepKm, forKey: "aviator.distancePerStepKm") }
-    }
+    // Az AVIATOR Mark 1 két valós mérési pontja alapján a távolság
+    // kb. 0,726 méteres lépéshosszal egyezik az óra kijelzésével.
+    private let distancePerStepKm: Double = 0.000726
     @Published var caloriesPerStep: Double = 0.04 {
         didSet { UserDefaults.standard.set(caloriesPerStep, forKey: "aviator.caloriesPerStep") }
     }
@@ -52,9 +51,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        let d = UserDefaults.standard.double(forKey: "aviator.distancePerStepKm")
         let c = UserDefaults.standard.double(forKey: "aviator.caloriesPerStep")
-        if d > 0 { distancePerStepKm = d }
         if c > 0 { caloriesPerStep = c }
         loadStoredDays()
         central = CBCentralManager(delegate: self, queue: .main)
@@ -156,17 +153,15 @@ final class BLEManager: NSObject, ObservableObject {
         max(0, Int((Double(steps) * caloriesPerStep).rounded()))
     }
 
-    func calibrate(distanceKm: Double, calories: Double) -> Bool {
-        guard let steps = todaySteps, steps > 0, distanceKm > 0, calories > 0 else {
-            status = "Előbb szinkronizáld a mai lépésszámot, majd add meg az órán látható km és kcal értéket."
+    func calibrateCalories(_ calories: Double) -> Bool {
+        guard let steps = todaySteps, steps > 0, calories > 0 else {
+            status = "Előbb szinkronizáld a mai lépésszámot, majd add meg az órán látható kcal értéket."
             return false
         }
-        distancePerStepKm = distanceKm / Double(steps)
         caloriesPerStep = calories / Double(steps)
-        // A mai napot újramentjük, hogy az összes nézet azonnal frissüljön.
         upsertToday(steps: steps)
-        status = String(format: "✓ Kalibrálva: %.2f km és %.0f kcal / %d lépés", distanceKm, calories, steps)
-        log(String(format: "Kalibráció: %d lépés -> %.2f km, %.0f kcal", steps, distanceKm, calories))
+        status = String(format: "✓ Kalória kalibrálva: %.0f kcal / %d lépés", calories, steps)
+        log(String(format: "Kalória kalibráció: %d lépés -> %.0f kcal", steps, calories))
         return true
     }
 

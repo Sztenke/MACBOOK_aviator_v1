@@ -12,7 +12,6 @@ struct ContentView: View {
     @State private var selectedTab = 0
     @State private var metric: Metric = .steps
     @State private var shownMonth = Date()
-    @State private var calibrationDistance = 2.74
     @State private var calibrationCalories = 178.0
 
     var body: some View {
@@ -79,17 +78,14 @@ struct ContentView: View {
                 card("Mai kalória", today.map { "\(ble.calories(for: $0.steps)) kcal" } ?? "–", "flame")
             }
 
-            GroupBox("Távolság és kalória kalibrálása") {
+            GroupBox("Kalória kalibrálása") {
                 HStack(spacing: 12) {
                     Text("Az órán most:").foregroundStyle(.secondary)
-                    TextField("2.74", value: $calibrationDistance, format: .number.precision(.fractionLength(2)))
-                        .frame(width: 80).textFieldStyle(.roundedBorder)
-                    Text("km")
-                    TextField("178", value: $calibrationCalories, format: .number.precision(.fractionLength(0)))
+                    TextField("96", value: $calibrationCalories, format: .number.precision(.fractionLength(0)))
                         .frame(width: 80).textFieldStyle(.roundedBorder)
                     Text("kcal")
-                    Button("Kalibrálás a jelenlegi lépésszámhoz") {
-                        _ = ble.calibrate(distanceKm: calibrationDistance, calories: calibrationCalories)
+                    Button("Kalória kalibrálása") {
+                        _ = ble.calibrateCalories(calibrationCalories)
                     }
                     .disabled(today == nil)
                     Spacer()
@@ -97,7 +93,7 @@ struct ContentView: View {
                 .padding(4)
             }
 
-            Text("A Mark 1 jelenlegi állapotcsomagjából a napi lépésszám és az akkukód olvasható stabilan. A km és kcal értékeket az óra kijelzett értékeihez egyszer kalibráljuk; ezután a napi és havi nézet automatikusan számol velük.")
+            Text("A távolság automatikusan számolódik 0,726 m/lépés alapján, így ehhez már nem kell kézi kalibrálás. A kcal egyelőre külön kalibrálható, amíg a Mark 1 eredeti kalóriaszámítását pontosan vissza nem fejtjük.")
                 .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             Spacer()
             status
