@@ -1,9 +1,9 @@
-AVIATOR Sync Mac v4.3
+AVIATOR Sync Mac v4.4
 
-Változások a v4.2-höz képest:
-- A távolság manuális kalibrálása megszűnt.
-- A távolság automatikusan 0,726 méter/lépés alapján számolódik.
-- A havi távolság és a távolság grafikon is ugyanezt használja.
-- A kalória kalibrálása egyelőre megmaradt, mert az eredeti Mark 1 kcal algoritmusa még nincs pontosan visszafejtve.
-- A BLE kommunikációhoz, időszinkronhoz, napi lépésszám-lekéréshez és AVIATOR eszközszűréshez nem nyúltunk.
-- Az akkumulátor raw -> százalék átszámítás ebben a verzióban még változatlan; ezt külön mérési pontok alapján pontosítjuk.
+- Mark 1 napi lépésszám lekérés megmaradt.
+- Akkumulátor lekérés külön, az eredeti AVIATOR Android APK logikája szerint:
+  TX: 6E 01 0F 01 8F
+  válasz 4. bájtja x 5, legfeljebb 100%.
+- Az akku ikon követi a kijelzett töltöttségi szintet.
+- Távolság: 0,726 m/lépés.
+- Kalória továbbra is kalibrálható.

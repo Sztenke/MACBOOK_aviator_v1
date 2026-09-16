@@ -72,7 +72,7 @@ struct ContentView: View {
             }
 
             HStack(spacing: 12) {
-                card("Akkumulátor", ble.batteryLevel.map { "\($0)%" } ?? "–", "battery.75")
+                card("Akkumulátor", ble.batteryLevel.map { "\($0)%" } ?? "–", batteryIcon)
                 card("Mai lépések", today.map { "\($0.steps)" } ?? "–", "figure.walk")
                 card("Mai távolság", today.map { String(format: "%.2f km", ble.distanceKm(for: $0.steps)) } ?? "–", "location")
                 card("Mai kalória", today.map { "\(ble.calories(for: $0.steps)) kcal" } ?? "–", "flame")
@@ -154,6 +154,18 @@ struct ContentView: View {
             }.background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 8))
             status
         }.padding(.top, 8)
+    }
+
+
+    private var batteryIcon: String {
+        guard let level = ble.batteryLevel else { return "battery.0" }
+        switch level {
+        case ..<13: return "battery.0"
+        case ..<38: return "battery.25"
+        case ..<63: return "battery.50"
+        case ..<88: return "battery.75"
+        default: return "battery.100"
+        }
     }
 
     private var today: ActivityDay? {

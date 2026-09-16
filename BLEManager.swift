@@ -45,6 +45,8 @@ final class BLEManager: NSObject, ObservableObject {
 
     // A működő verzióból visszaállított Mark 1 lekérés.
     private var awaitingCurrentStatus = false
+    private var awaitingBattery = false
+    private var currentStatusRequested = false
     private var manualDisconnect = false
     private var reconnectPeripheral: CBPeripheral?
     private let dayStoreKey = "aviator.activityDays.v4"
@@ -128,14 +130,38 @@ final class BLEManager: NSObject, ObservableObject {
             status = "Előbb csatlakozz az AVIATOR órához."
             return
         }
+
+        // Az eredeti AVIATOR Mark 1 alkalmazás külön kéri le az akkumulátort.
+        // getBatteryLevel() parancs: 6E 01 0F 01 8F
+        awaitingBattery = true
+        awaitingCurrentStatus = false
+        currentStatusRequested = false
+        sendCommand([0x6E, 0x01, 0x0F, 0x01, 0x8F], label: "akkumulátor")
+        status = "Akkumulátor lekérése…"
+
+        // Ha az akkuválasz nem érkezik meg időben, a lépésszámot akkor is lekérjük.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self else { return }
+            if self.awaitingBattery {
+                self.awaitingBattery = false
+                self.log("Akkumulátor válasz időtúllépés")
+            }
+            self.requestCurrentStatusIfNeeded()
+        }
+    }
+
+    private func requestCurrentStatusIfNeeded() {
+        guard canWrite, !currentStatusRequested else { return }
+        currentStatusRequested = true
         awaitingCurrentStatus = true
-        // Ez az a kérés, amellyel a felhasználónál ténylegesen működött a napi lépésszám.
+        // A napi lépésszám működő Mark 1 lekérése.
         sendCommand([0x6E, 0x01, 0x1B, 0x01, 0x8F], label: "napi aktuális állapot")
-        status = "Mai lépésszám és akkumulátor lekérése…"
+        status = "Mai lépésszám lekérése…"
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, self.awaitingCurrentStatus else { return }
             self.awaitingCurrentStatus = false
+            self.currentStatusRequested = false
             self.status = "Nem érkezett értelmezhető napi állapotválasz."
             self.log("Napi állapot időtúllépés")
         }
@@ -188,8 +214,25 @@ final class BLEManager: NSObject, ObservableObject {
         guard !bytes.isEmpty else { return }
         log("RX: \(hex(bytes))")
         guard bytes.first == 0x6E, bytes.last == 0x8F else { return }
+
+        // Az eredeti Android APK SendCode.getBatteryLevel() metódusa a
+        // 6E 01 0F 01 8F parancsot küldi. A hozzá tartozó 5 bájtos válaszban
+        // a 4. bájt a töltöttségi egység; az eredeti kód ezt 5-tel szorozza,
+        // majd 100%-nál levágja.
+        if awaitingBattery, bytes.count == 5 {
+            let raw = Int(bytes[3])
+            batteryRaw = raw
+            let battery = max(0, min(100, raw * 5))
+            batteryLevel = battery
+            awaitingBattery = false
+            log("Akkumulátor: \(battery)% (raw \(raw), gyári képlet: raw×5)")
+            requestCurrentStatusIfNeeded()
+            return
+        }
+
         guard awaitingCurrentStatus, bytes.count == 20 else { return }
         awaitingCurrentStatus = false
+        currentStatusRequested = false
 
         // A működő verzió mezője: [11...14] little-endian = mai lépésszám.
         let steps = Int(leUInt32(bytes, 11))
@@ -199,16 +242,14 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
 
-        // A Mark 1 teljes töltésnél 0x28 (=40) értéket küldött.
-        // Ezt 0...40 skálaként kezeljük és 0...100%-ra alakítjuk.
-        let rawBattery = Int(bytes[3])
-        batteryRaw = rawBattery
-        let battery = max(0, min(100, Int((Double(rawBattery) / 40.0 * 100.0).rounded())))
-        batteryLevel = battery
-
         upsertToday(steps: steps)
-        status = "✓ Mai adatok frissítve: \(steps) lépés, akku \(battery)%"
-        log("Mai állapot: \(steps) lépés | akku \(battery)% (raw \(rawBattery))")
+        if let battery = batteryLevel {
+            status = "✓ Mai adatok frissítve: \(steps) lépés, akku \(battery)%"
+            log("Mai állapot: \(steps) lépés | akku \(battery)%")
+        } else {
+            status = "✓ Mai adatok frissítve: \(steps) lépés"
+            log("Mai állapot: \(steps) lépés | akku nem érkezett")
+        }
     }
 
     private func leUInt32(_ bytes: [UInt8], _ start: Int) -> UInt32 {
@@ -303,6 +344,8 @@ extension BLEManager: CBCentralManagerDelegate {
         connectedID = nil; canSync = false
         connectedPeripheral = nil; writeCharacteristic = nil; notifyCharacteristic = nil
         awaitingCurrentStatus = false
+        awaitingBattery = false
+        currentStatusRequested = false
         if manualDisconnect {
             status = "Az óra kézzel lecsatlakoztatva."
             return
